@@ -802,8 +802,18 @@ async function processMessageTags(messageId) {
  * This fires AFTER the message is rendered to DOM
  */
 async function onMessageReceived(messageId) {
+    console.log('[IIG] onMessageReceived called with messageId:', messageId);
+    
     const settings = getSettings();
-    if (!settings.enabled) return;
+    if (!settings.enabled) {
+        console.log('[IIG] Extension disabled, skipping');
+        return;
+    }
+    
+    const context = SillyTavern.getContext();
+    const message = context.chat[messageId];
+    console.log('[IIG] Message content preview:', message?.mes?.substring(0, 100));
+    console.log('[IIG] Contains IMG:GEN tag:', message?.mes?.includes('[IMG:GEN:'));
     
     await processMessageTags(messageId);
 }
@@ -1082,6 +1092,11 @@ function bindSettingsEvents() {
 (function init() {
     const context = SillyTavern.getContext();
     
+    // Debug: log available event types
+    console.log('[IIG] Available event_types:', context.event_types);
+    console.log('[IIG] CHARACTER_MESSAGE_RENDERED:', context.event_types.CHARACTER_MESSAGE_RENDERED);
+    console.log('[IIG] MESSAGE_SWIPED:', context.event_types.MESSAGE_SWIPED);
+    
     // Load settings
     getSettings();
     
@@ -1091,15 +1106,21 @@ function bindSettingsEvents() {
         console.log('[IIG] Inline Image Generation extension loaded');
     });
     
+    // Wrapper to add debug logging
+    const handleMessage = async (messageId) => {
+        console.log('[IIG] Event triggered for message:', messageId);
+        await onMessageReceived(messageId);
+    };
+    
     // Listen for new messages AFTER they're rendered in DOM
     // CHARACTER_MESSAGE_RENDERED fires after addOneMessage() completes
-    context.eventSource.makeLast(context.event_types.CHARACTER_MESSAGE_RENDERED, onMessageReceived);
+    context.eventSource.makeLast(context.event_types.CHARACTER_MESSAGE_RENDERED, handleMessage);
     
     // Also handle swipes - when user swipes to a different AI response
-    context.eventSource.on(context.event_types.MESSAGE_SWIPED, onMessageReceived);
+    context.eventSource.on(context.event_types.MESSAGE_SWIPED, handleMessage);
     
     // Handle message updates (edits)
-    context.eventSource.on(context.event_types.MESSAGE_UPDATED, onMessageReceived);
+    context.eventSource.on(context.event_types.MESSAGE_UPDATED, handleMessage);
     
     console.log('[IIG] Inline Image Generation extension initialized');
 })();
