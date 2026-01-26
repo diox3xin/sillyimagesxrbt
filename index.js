@@ -708,7 +708,16 @@ async function processMessageTags(messageId) {
     if (!message || message.is_user) return;
     
     const tags = parseImageTags(message.mes);
-    if (tags.length === 0) return;
+    console.log('[IIG] parseImageTags returned:', tags.length, 'tags');
+    if (tags.length > 0) {
+        console.log('[IIG] First tag:', JSON.stringify(tags[0]).substring(0, 200));
+    }
+    if (tags.length === 0) {
+        console.log('[IIG] No tags found by parser, checking raw message...');
+        const rawMatch = message.mes.match(/\[IMG:GEN:\{[^]*?\}\]/);
+        console.log('[IIG] Raw regex match:', rawMatch ? rawMatch[0].substring(0, 100) : 'null');
+        return;
+    }
     
     console.log(`[IIG] Found ${tags.length} image tag(s) in message ${messageId}`);
     toastr.info(`Найдено тегов: ${tags.length}. Генерация...`, 'Генерация картинок', { timeOut: 3000 });
