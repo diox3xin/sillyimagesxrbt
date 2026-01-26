@@ -248,31 +248,39 @@ async function getCharacterAvatarBase64() {
 }
 
 /**
- * Get user avatar as base64
+ * Get user avatar as base64 (full resolution, not thumbnail)
  */
 async function getUserAvatarBase64() {
     try {
         const context = SillyTavern.getContext();
         let avatarUrl = null;
         
-        // Method 1: Use context.getUserAvatar if available
-        if (typeof context.getUserAvatar === 'function') {
-            try {
-                avatarUrl = context.getUserAvatar();
-            } catch (e) { /* ignore */ }
-        }
-        
-        // Method 2: Get from DOM - user avatar block
-        if (!avatarUrl) {
-            const userAvatarImg = document.querySelector('#user_avatar_block img, .mes.last_mes.default_ch .avatar img');
-            if (userAvatarImg?.src && !userAvatarImg.src.includes('default_avatar')) {
-                avatarUrl = userAvatarImg.src;
-            }
-        }
-        
-        // Method 3: Check persona if available
-        if (!avatarUrl && context.persona) {
+        // Get persona/user avatar filename - prefer direct file path over thumbnail
+        // Method 1: Check active persona
+        if (context.personas && context.persona) {
+            // persona is the filename
             avatarUrl = `/User Avatars/${encodeURIComponent(context.persona)}`;
+            console.log('[IIG] Using persona avatar path:', avatarUrl);
+        }
+        
+        // Method 2: Try to get from user_avatar setting
+        if (!avatarUrl && context.user_avatar) {
+            avatarUrl = `/User Avatars/${encodeURIComponent(context.user_avatar)}`;
+            console.log('[IIG] Using user_avatar path:', avatarUrl);
+        }
+        
+        // Method 3: Get filename from DOM and construct direct path
+        if (!avatarUrl) {
+            const userAvatarImg = document.querySelector('#user_avatar_block img');
+            if (userAvatarImg?.src) {
+                // Extract filename from thumbnail URL or src
+                const srcUrl = userAvatarImg.src;
+                const fileMatch = srcUrl.match(/file=([^&]+)/);
+                if (fileMatch) {
+                    avatarUrl = `/User Avatars/${decodeURIComponent(fileMatch[1])}`;
+                    console.log('[IIG] Extracted avatar filename from thumbnail:', avatarUrl);
+                }
+            }
         }
         
         if (!avatarUrl) {
@@ -280,7 +288,7 @@ async function getUserAvatarBase64() {
             return null;
         }
         
-        console.log('[IIG] Found user avatar:', avatarUrl);
+        console.log('[IIG] Found user avatar (full res):', avatarUrl);
         return await imageUrlToBase64(avatarUrl);
     } catch (error) {
         console.error('[IIG] Error getting user avatar:', error);
@@ -291,19 +299,27 @@ async function getUserAvatarBase64() {
 /**
  * Generate image via OpenAI-compatible endpoint
  */
-async function generateImageOpenAI(prompt, style, referenceImages = []) {
+async function generateImageOpenAI(prompt, style, referenceImages = [], options = {}) {
     const settings = getSettings();
     const url = `${settings.endpoint.replace(/\/$/, '')}/v1/images/generations`;
     
     // Combine style and prompt
     const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
     
+    // Map aspect ratio to size if provided in tag
+    let size = settings.size;
+    if (options.aspectRatio) {
+        if (options.aspectRatio === '16:9') size = '1792x1024';
+        else if (options.aspectRatio === '9:16') size = '1024x1792';
+        else if (options.aspectRatio === '1:1') size = '1024x1024';
+    }
+    
     const body = {
         model: settings.model,
         prompt: fullPrompt,
         n: 1,
-        size: settings.size,
-        quality: settings.quality,
+        size: size,
+        quality: options.quality || settings.quality,
         response_format: 'b64_json'
     };
     
@@ -349,15 +365,20 @@ async function generateImageOpenAI(prompt, style, referenceImages = []) {
 /**
  * Generate image via Gemini-compatible endpoint (nano-banana)
  */
-async function generateImageGemini(prompt, style, referenceImages = []) {
+async function generateImageGemini(prompt, style, referenceImages = [], options = {}) {
     const settings = getSettings();
     const model = settings.model;
     const url = `${settings.endpoint.replace(/\/$/, '')}/v1beta/models/${model}:generateContent`;
     
-    // Map size to aspect ratio
-    let aspectRatio = '1:1';
-    if (settings.size === '1024x1792' || settings.size === '768x1344') aspectRatio = '9:16';
-    else if (settings.size === '1792x1024' || settings.size === '1344x768') aspectRatio = '16:9';
+    // Determine aspect ratio: tag option > settings
+    let aspectRatio = options.aspectRatio || '1:1';
+    if (!options.aspectRatio) {
+        // Fallback to settings size
+        if (settings.size === '1024x1792' || settings.size === '768x1344') aspectRatio = '9:16';
+        else if (settings.size === '1792x1024' || settings.size === '1344x768') aspectRatio = '16:9';
+    }
+    
+    console.log(`[IIG] Using aspect ratio: ${aspectRatio}`);
     
     // Build parts array
     const parts = [];
@@ -372,8 +393,15 @@ async function generateImageGemini(prompt, style, referenceImages = []) {
         });
     }
     
-    // Add prompt with style
-    const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
+    // Add prompt with style and reference instruction
+    let fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
+    
+    // If reference images provided, add instruction to copy appearance
+    if (referenceImages.length > 0) {
+        const refInstruction = `[CRITICAL: The reference image(s) above show the EXACT appearance of the character(s). You MUST precisely copy their: face structure, eye color, hair color and style, skin tone, body type, clothing, and all distinctive features. Do not deviate from the reference appearances.]`;
+        fullPrompt = `${refInstruction}\n\n${fullPrompt}`;
+    }
+    
     parts.push({ text: fullPrompt });
     
     console.log(`[IIG] Gemini request: ${referenceImages.length} reference image(s) + prompt (${fullPrompt.length} chars)`);
@@ -461,8 +489,12 @@ function sanitizeForHtml(text) {
 
 /**
  * Generate image with retry logic
+ * @param {string} prompt - Image description
+ * @param {string} style - Style tag
+ * @param {function} onStatusUpdate - Status callback
+ * @param {object} options - Additional options (aspectRatio, quality)
  */
-async function generateImageWithRetry(prompt, style, onStatusUpdate) {
+async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {}) {
     // Validate settings first
     validateSettings();
     
@@ -503,9 +535,9 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate) {
             
             // Choose API based on type or model
             if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
-                return await generateImageGemini(prompt, style, referenceImages);
+                return await generateImageGemini(prompt, style, referenceImages, options);
             } else {
-                return await generateImageOpenAI(prompt, style, referenceImages);
+                return await generateImageOpenAI(prompt, style, referenceImages, options);
             }
         } catch (error) {
             lastError = error;
@@ -614,6 +646,8 @@ function parseImageTags(text) {
                 index: markerIndex,
                 style: data.style || '',
                 prompt: data.prompt || '',
+                aspectRatio: data.aspect_ratio || data.aspectRatio || null, // e.g. "16:9", "9:16", "1:1"
+                quality: data.quality || null, // e.g. "hd", "standard"
                 isInImgSrc: isInImgSrc // Flag for replacement logic
             });
         } catch (e) {
@@ -686,7 +720,8 @@ async function retryGeneration(placeholder, tagInfo) {
         const dataUrl = await generateImageWithRetry(
             tagInfo.prompt,
             tagInfo.style,
-            (status) => { statusEl.textContent = status; }
+            (status) => { statusEl.textContent = status; },
+            { aspectRatio: tagInfo.aspectRatio, quality: tagInfo.quality }
         );
         
         // Save image to file
@@ -812,7 +847,8 @@ async function processMessageTags(messageId) {
             const dataUrl = await generateImageWithRetry(
                 tag.prompt,
                 tag.style,
-                (status) => { statusEl.textContent = status; }
+                (status) => { statusEl.textContent = status; },
+                { aspectRatio: tag.aspectRatio, quality: tag.quality }
             );
             
             // Save image to file instead of keeping base64
