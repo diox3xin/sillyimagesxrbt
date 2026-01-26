@@ -376,6 +376,8 @@ async function generateImageGemini(prompt, style, referenceImages = []) {
     const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
     parts.push({ text: fullPrompt });
     
+    console.log(`[IIG] Gemini request: ${referenceImages.length} reference image(s) + prompt (${fullPrompt.length} chars)`);
+    
     const body = {
         contents: [{
             role: 'user',
