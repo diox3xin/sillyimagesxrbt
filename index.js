@@ -603,7 +603,7 @@ function parseImageTags(text) {
             console.warn('[IIG] Failed to parse tag JSON:', jsonStr, e);
         }
         
-        searchStart = fullMatchEnd;
+        searchStart = jsonEnd + 1; // Move past the closing ]
     }
     
     return tags;
