@@ -473,14 +473,24 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate) {
     
     if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
         if (settings.sendCharAvatar) {
+            console.log('[IIG] Fetching character avatar for reference...');
             const charAvatar = await getCharacterAvatarBase64();
-            if (charAvatar) referenceImages.push(charAvatar);
+            if (charAvatar) {
+                referenceImages.push(charAvatar);
+                console.log('[IIG] Character avatar added to references');
+            }
         }
         
         if (settings.sendUserAvatar) {
+            console.log('[IIG] Fetching user avatar for reference...');
             const userAvatar = await getUserAvatarBase64();
-            if (userAvatar) referenceImages.push(userAvatar);
+            if (userAvatar) {
+                referenceImages.push(userAvatar);
+                console.log('[IIG] User avatar added to references');
+            }
         }
+        
+        console.log(`[IIG] Total reference images: ${referenceImages.length}`);
     }
     
     let lastError;
@@ -765,12 +775,33 @@ async function processMessageTags(messageId) {
         );
         console.log(`[IIG] Placeholder inserted:`, beforeReplace !== mesTextEl.innerHTML);
         
-        const placeholderSpan = mesTextEl.querySelector(`[data-iig-placeholder="${tagId}"]`);
+        let placeholderSpan = mesTextEl.querySelector(`[data-iig-placeholder="${tagId}"]`);
+        
+        // If tag is inside img src, find the img element and replace it
+        if (!placeholderSpan && tag.isInImgSrc) {
+            console.log(`[IIG] Tag is inside img src, looking for img element...`);
+            // Find img element that contains our tag in src
+            const allImgs = mesTextEl.querySelectorAll('img');
+            for (const img of allImgs) {
+                if (img.src && img.src.includes('[IMG:GEN:')) {
+                    console.log(`[IIG] Found img with tag in src, replacing with placeholder`);
+                    img.replaceWith(loadingPlaceholder);
+                    placeholderSpan = loadingPlaceholder; // Mark as found
+                    break;
+                }
+            }
+        }
+        
         if (placeholderSpan) {
-            placeholderSpan.replaceWith(loadingPlaceholder);
+            if (placeholderSpan !== loadingPlaceholder) {
+                placeholderSpan.replaceWith(loadingPlaceholder);
+            }
             console.log(`[IIG] Loading placeholder shown`);
         } else {
-            console.log(`[IIG] Could not find placeholder span, tag might be inside img src`);
+            console.log(`[IIG] Could not find placeholder span or img element`);
+            // Append placeholder at the end as fallback
+            mesTextEl.appendChild(loadingPlaceholder);
+            console.log(`[IIG] Appended placeholder as fallback`);
         }
         
         const statusEl = loadingPlaceholder.querySelector('.iig-status');
