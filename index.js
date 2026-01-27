@@ -1808,13 +1808,12 @@ function bindSettingsEvents() {
     
     // Listen for new messages AFTER they're rendered in DOM
     // CHARACTER_MESSAGE_RENDERED fires after addOneMessage() completes
+    // This is the ONLY event we handle - no auto-retry on swipe/update
     context.eventSource.makeLast(context.event_types.CHARACTER_MESSAGE_RENDERED, handleMessage);
     
-    // Also handle swipes - when user swipes to a different AI response
-    context.eventSource.on(context.event_types.MESSAGE_SWIPED, handleMessage);
-    
-    // Handle message updates (edits)
-    context.eventSource.on(context.event_types.MESSAGE_UPDATED, handleMessage);
+    // NOTE: We intentionally DO NOT handle MESSAGE_SWIPED or MESSAGE_UPDATED
+    // Swipe = user wants NEW content, not to retry old error images
+    // If user wants to retry failed images, they click the error image manually
     
     console.log('[IIG] Inline Image Generation extension initialized');
 })();
