@@ -50,20 +50,22 @@
     display: none;
 }
 
-/* Loading Placeholder */
+/* Loading Placeholder - adaptive to container */
 .iig-loading-placeholder {
-    display: flex;
+    display: inline-flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    min-height: 200px;
-    min-width: 200px;
-    max-width: 400px;
+    min-height: 150px;
+    min-width: 150px;
+    max-width: 100%;
+    width: auto;
     background: var(--SmartThemeBlurTintColor);
     border-radius: 10px;
-    padding: 20px;
-    margin: 10px 0;
+    padding: 15px;
+    margin: 5px;
     border: 2px dashed var(--SmartThemeBorderColor);
+    box-sizing: border-box;
 }
 
 .iig-loading-placeholder .iig-spinner {

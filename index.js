@@ -933,56 +933,83 @@ async function processMessageTags(messageId) {
     const processTag = async (tag, index) => {
         const tagId = `iig-${messageId}-${index}`;
         
-        console.log(`[IIG] Processing tag ${index}:`, tag.fullMatch.substring(0, 50));
+        iigLog('INFO', `Processing tag ${index}: ${tag.fullMatch.substring(0, 50)}`);
         
-        // Replace tag with loading placeholder in the DOM
+        // Create loading placeholder
         const loadingPlaceholder = createLoadingPlaceholder(tagId);
+        let targetElement = null;
         
-        // Find and replace the tag in the rendered HTML
-        // The tag might be HTML-escaped in the rendered content
-        const tagEscaped = tag.fullMatch
-            .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-            .replace(/"/g, '(?:"|&quot;)'); // Handle HTML entity escaping
-        const tagRegex = new RegExp(tagEscaped, 'g');
-        
-        console.log(`[IIG] Looking for tag in HTML, regex:`, tagEscaped.substring(0, 50));
-        console.log(`[IIG] mesTextEl.innerHTML contains tag:`, mesTextEl.innerHTML.includes('[IMG:GEN:'));
-        
-        // Insert placeholder marker
-        const beforeReplace = mesTextEl.innerHTML;
-        mesTextEl.innerHTML = mesTextEl.innerHTML.replace(
-            tagRegex,
-            `<span data-iig-placeholder="${tagId}"></span>`
-        );
-        console.log(`[IIG] Placeholder inserted:`, beforeReplace !== mesTextEl.innerHTML);
-        
-        let placeholderSpan = mesTextEl.querySelector(`[data-iig-placeholder="${tagId}"]`);
-        
-        // If tag is inside img src, find the img element and replace it
-        if (!placeholderSpan && tag.isInImgSrc) {
-            console.log(`[IIG] Tag is inside img src, looking for img element...`);
-            // Find img element that contains our tag in src
-            const allImgs = mesTextEl.querySelectorAll('img');
+        if (tag.isNewFormat) {
+            // NEW FORMAT: <img instruction='...'> is a real DOM element
+            // Find it by looking for img with instruction attribute
+            const allImgs = mesTextEl.querySelectorAll('img[instruction]');
             for (const img of allImgs) {
-                if (img.src && img.src.includes('[IMG:GEN:')) {
-                    console.log(`[IIG] Found img with tag in src, replacing with placeholder`);
-                    img.replaceWith(loadingPlaceholder);
-                    placeholderSpan = loadingPlaceholder; // Mark as found
+                // Match by checking if instruction contains our prompt
+                const instruction = img.getAttribute('instruction');
+                if (instruction && instruction.includes(tag.prompt.substring(0, 30))) {
+                    iigLog('INFO', `Found img element with instruction attribute`);
+                    targetElement = img;
                     break;
+                }
+            }
+            
+            // Alternative: find by src containing markers
+            if (!targetElement) {
+                for (const img of allImgs) {
+                    const src = img.getAttribute('src') || '';
+                    if (src.includes('[IMG:GEN]') || src.includes('[IMG:ERROR]') || !src || src === '') {
+                        iigLog('INFO', `Found img element with generation marker in src`);
+                        targetElement = img;
+                        break;
+                    }
+                }
+            }
+        } else {
+            // LEGACY FORMAT: [IMG:GEN:{...}] - use regex replacement
+            const tagEscaped = tag.fullMatch
+                .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                .replace(/"/g, '(?:"|&quot;)');
+            const tagRegex = new RegExp(tagEscaped, 'g');
+            
+            const beforeReplace = mesTextEl.innerHTML;
+            mesTextEl.innerHTML = mesTextEl.innerHTML.replace(
+                tagRegex,
+                `<span data-iig-placeholder="${tagId}"></span>`
+            );
+            
+            if (beforeReplace !== mesTextEl.innerHTML) {
+                targetElement = mesTextEl.querySelector(`[data-iig-placeholder="${tagId}"]`);
+                iigLog('INFO', `Legacy tag replaced with placeholder span`);
+            }
+            
+            // Also check for img src containing legacy tag
+            if (!targetElement) {
+                const allImgs = mesTextEl.querySelectorAll('img');
+                for (const img of allImgs) {
+                    if (img.src && img.src.includes('[IMG:GEN:')) {
+                        targetElement = img;
+                        iigLog('INFO', `Found img with legacy tag in src`);
+                        break;
+                    }
                 }
             }
         }
         
-        if (placeholderSpan) {
-            if (placeholderSpan !== loadingPlaceholder) {
-                placeholderSpan.replaceWith(loadingPlaceholder);
+        // Replace target with placeholder, preserving parent styling context
+        if (targetElement) {
+            // Copy some styling context from parent for adaptive placeholder
+            const parent = targetElement.parentElement;
+            if (parent) {
+                const parentStyle = window.getComputedStyle(parent);
+                if (parentStyle.display === 'flex' || parentStyle.display === 'grid') {
+                    loadingPlaceholder.style.alignSelf = 'center';
+                }
             }
-            console.log(`[IIG] Loading placeholder shown`);
+            targetElement.replaceWith(loadingPlaceholder);
+            iigLog('INFO', `Loading placeholder shown (replaced target element)`);
         } else {
-            console.log(`[IIG] Could not find placeholder span or img element`);
-            // Append placeholder at the end as fallback
+            iigLog('WARN', `Could not find target element, appending placeholder as fallback`);
             mesTextEl.appendChild(loadingPlaceholder);
-            console.log(`[IIG] Appended placeholder as fallback`);
         }
         
         const statusEl = loadingPlaceholder.querySelector('.iig-status');
