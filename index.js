@@ -627,7 +627,7 @@ async function checkFileExists(path) {
 /**
  * Parse image generation tags from message text
  * Supports two formats:
- * 1. NEW: <img instruction='{"style":"...","prompt":"..."}' src="[IMG:GEN]">
+ * 1. NEW: <img data-iig-instruction='{"style":"...","prompt":"..."}' src="[IMG:GEN]">
  * 2. LEGACY: [IMG:GEN:{"style":"...","prompt":"..."}]
  * 
  * @param {string} text - Message text
@@ -639,8 +639,8 @@ async function parseImageTags(text, options = {}) {
     const { checkExistence = false, forceAll = false } = options;
     const tags = [];
     
-    // === NEW FORMAT: <img instruction="{...}" src="[IMG:GEN]"> ===
-    const imgTagRegex = /<img\s+[^>]*instruction\s*=\s*(['"])([\s\S]*?)\1[^>]*>/gi;
+    // === NEW FORMAT: <img data-iig-instruction="{...}" src="[IMG:GEN]"> ===
+    const imgTagRegex = /<img\s+[^>]*data-iig-instruction\s*=\s*(['"])([\s\S]*?)\1[^>]*>/gi;
     let imgMatch;
     
     while ((imgMatch = imgTagRegex.exec(text)) !== null) {
@@ -940,25 +940,91 @@ async function processMessageTags(messageId) {
         let targetElement = null;
         
         if (tag.isNewFormat) {
-            // NEW FORMAT: <img instruction='...'> is a real DOM element
-            // Find it by looking for img with instruction attribute
-            const allImgs = mesTextEl.querySelectorAll('img[instruction]');
+            // NEW FORMAT: <img data-iig-instruction='...'> is a real DOM element
+            // Find it by looking for img with data-iig-instruction attribute
+            const allImgs = mesTextEl.querySelectorAll('img[data-iig-instruction]');
+            iigLog('INFO', `Searching for img element. Found ${allImgs.length} img[data-iig-instruction] elements in DOM`);
+            
+            // Debug: log what we're looking for vs what's in DOM
+            const searchPrompt = tag.prompt.substring(0, 30);
+            iigLog('INFO', `Searching for prompt starting with: "${searchPrompt}"`);
+            
             for (const img of allImgs) {
-                // Match by checking if instruction contains our prompt
-                const instruction = img.getAttribute('instruction');
-                if (instruction && instruction.includes(tag.prompt.substring(0, 30))) {
-                    iigLog('INFO', `Found img element with instruction attribute`);
-                    targetElement = img;
-                    break;
+                const instruction = img.getAttribute('data-iig-instruction');
+                const src = img.getAttribute('src') || '';
+                iigLog('INFO', `DOM img - src: "${src.substring(0, 50)}", instruction (first 100): "${instruction?.substring(0, 100)}"`);
+                
+                // Try multiple matching strategies
+                if (instruction) {
+                    // Strategy 1: Decode HTML entities and normalize quotes, then match
+                    const decodedInstruction = instruction
+                        .replace(/&quot;/g, '"')
+                        .replace(/&apos;/g, "'")
+                        .replace(/&#39;/g, "'")
+                        .replace(/&#34;/g, '"')
+                        .replace(/&amp;/g, '&');
+                    
+                    // Also normalize the search prompt the same way
+                    const normalizedSearchPrompt = searchPrompt
+                        .replace(/&quot;/g, '"')
+                        .replace(/&apos;/g, "'")
+                        .replace(/&#39;/g, "'")
+                        .replace(/&#34;/g, '"')
+                        .replace(/&amp;/g, '&');
+                    
+                    // Check if decoded instruction contains the prompt
+                    if (decodedInstruction.includes(normalizedSearchPrompt)) {
+                        iigLog('INFO', `Found img element via decoded instruction match`);
+                        targetElement = img;
+                        break;
+                    }
+                    
+                    // Strategy 2: Try to parse the instruction as JSON and compare prompts
+                    try {
+                        const normalizedJson = decodedInstruction.replace(/'/g, '"');
+                        const instructionData = JSON.parse(normalizedJson);
+                        if (instructionData.prompt && instructionData.prompt.substring(0, 30) === tag.prompt.substring(0, 30)) {
+                            iigLog('INFO', `Found img element via JSON prompt match`);
+                            targetElement = img;
+                            break;
+                        }
+                    } catch (e) {
+                        // JSON parse failed, continue with other strategies
+                    }
+                    
+                    // Strategy 3: Raw instruction contains raw search prompt (original approach)
+                    if (instruction.includes(searchPrompt)) {
+                        iigLog('INFO', `Found img element via raw instruction match`);
+                        targetElement = img;
+                        break;
+                    }
                 }
             }
             
-            // Alternative: find by src containing markers
+            // Alternative: find by src containing markers (when prompt matching fails)
             if (!targetElement) {
+                iigLog('INFO', `Prompt matching failed, trying src marker matching...`);
                 for (const img of allImgs) {
                     const src = img.getAttribute('src') || '';
-                    if (src.includes('[IMG:GEN]') || src.includes('[IMG:ERROR]') || !src || src === '') {
-                        iigLog('INFO', `Found img element with generation marker in src`);
+                    // Check for generation markers or empty/broken src
+                    if (src.includes('[IMG:GEN]') || src.includes('[IMG:ERROR]') || src === '' || src === '#') {
+                        iigLog('INFO', `Found img element with generation marker in src: "${src}"`);
+                        targetElement = img;
+                        break;
+                    }
+                }
+            }
+            
+            // Strategy 4: If still not found, try looking at ALL imgs (not just those with data-iig-instruction attr)
+            // This handles cases where browser didn't parse data-iig-instruction as a valid attribute
+            if (!targetElement) {
+                iigLog('INFO', `Trying broader img search...`);
+                const allImgsInMes = mesTextEl.querySelectorAll('img');
+                for (const img of allImgsInMes) {
+                    const src = img.getAttribute('src') || '';
+                    // Look for src containing our markers
+                    if (src.includes('[IMG:GEN]') || src.includes('[IMG:ERROR]')) {
+                        iigLog('INFO', `Found img via broad search with marker src: "${src.substring(0, 50)}"`);
                         targetElement = img;
                         break;
                     }
@@ -1037,7 +1103,7 @@ async function processMessageTags(messageId) {
             
             // Update message.mes to persist the image
             if (tag.isNewFormat) {
-                // NEW FORMAT: <img instruction="..." src="[IMG:GEN]">
+                // NEW FORMAT: <img data-iig-instruction="..." src="[IMG:GEN]">
                 // Just update the src attribute with the real path
                 // LLM sees same format but with real path = already generated
                 const updatedTag = tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${imagePath}"`);
@@ -1152,8 +1218,8 @@ async function regenerateMessageImages(messageId) {
         const tagId = `iig-regen-${messageId}-${index}`;
         
         try {
-            // Find the existing img element with this instruction
-            const existingImg = mesTextEl.querySelector(`img[instruction]`);
+            // Find the existing img element with data-iig-instruction
+            const existingImg = mesTextEl.querySelector(`img[data-iig-instruction]`);
             if (existingImg) {
                 const loadingPlaceholder = createLoadingPlaceholder(tagId);
                 existingImg.replaceWith(loadingPlaceholder);
@@ -1229,9 +1295,9 @@ async function onMessageReceived(messageId) {
     const context = SillyTavern.getContext();
     const message = context.chat[messageId];
     
-    // Add regenerate button if message has instruction tags
+    // Add regenerate button if message has data-iig-instruction tags
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
-    if (messageElement && message?.mes?.includes('instruction=')) {
+    if (messageElement && message?.mes?.includes('data-iig-instruction=')) {
         addRegenerateButton(messageElement, messageId);
     }
     
