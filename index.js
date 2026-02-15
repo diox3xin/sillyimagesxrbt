@@ -583,14 +583,14 @@ async function getUserAvatarDataUrl() {
 
 /**
  * Generate image via Naistera custom endpoint
- * POST {endpoint}/prompt/api/generate
+ * POST {endpoint}/api/generate
  * Auth: Authorization: Bearer <token>
  * Response: { data_url, content_type }
  */
 async function generateImageNaistera(prompt, style, options = {}) {
     const settings = getSettings();
     const endpoint = settings.endpoint.replace(/\/$/, '');
-    const url = endpoint.endsWith('/prompt/api/generate') ? endpoint : `${endpoint}/prompt/api/generate`;
+    const url = endpoint.endsWith('/api/generate') ? endpoint : `${endpoint}/api/generate`;
 
     const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
 

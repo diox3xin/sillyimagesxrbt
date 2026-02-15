@@ -72,8 +72,8 @@ LLM видит тот же формат, но понимает: есть реа�
 
 **Naistera/Grok** — `/api/generate`
 - Авторизация: `Authorization: Bearer <token>`
-- URL эндпоинта в настройках: `https://naistera.org` (или сразу `https://naistera.org/api/generate`)
-- Тело: `{ "prompt": "...", "aspect_ratio": "3:2", "preset": "digital" }`
+- URL эндпоинта в настройках: `https://naistera.org/api/generate` (или `https://naistera.org` — расширение добавит `/api/generate`)
+- Тело: `{ "prompt": "...", "aspect_ratio": "3:2", "preset": "digital", "parent_post_id": "<grok-post-id>" }`
 - Ответ: `{ "data_url": "data:image/png;base64,...", "content_type": "image/png" }`
 - В настройках Naistera/Grok доступны параметры: `aspect_ratio` и `preset` (по умолчанию).
 
