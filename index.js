@@ -1618,8 +1618,6 @@ function createSettingsUI() {
                         <label for="iig_naistera_aspect_ratio">Соотношение сторон</label>
                         <select id="iig_naistera_aspect_ratio" class="flex1">
                             <option value="1:1" ${settings.naisteraAspectRatio === '1:1' ? 'selected' : ''}>1:1</option>
-                            <option value="16:9" ${settings.naisteraAspectRatio === '16:9' ? 'selected' : ''}>16:9</option>
-                            <option value="9:16" ${settings.naisteraAspectRatio === '9:16' ? 'selected' : ''}>9:16</option>
                             <option value="3:2" ${settings.naisteraAspectRatio === '3:2' ? 'selected' : ''}>3:2</option>
                             <option value="2:3" ${settings.naisteraAspectRatio === '2:3' ? 'selected' : ''}>2:3</option>
                         </select>
