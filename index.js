@@ -1573,20 +1573,20 @@ function createSettingsUI() {
         return;
     }
 
-    // Build NPC list HTML
-    const buildNpcListHtml = () => {
-        if (!settings.npcReferences || settings.npcReferences.length === 0) {
-            return '<p class="hint">Нет добавленных NPC</p>';
-        }
+  // Build NPC list HTML - COMPACT VERSION
+const buildNpcListHtml = () => {
+    if (!settings.npcReferences || settings.npcReferences.length === 0) {
+        return '<div class="iig-npc-empty">Нет добавленных NPC</div>';
+    }
 
-        return settings.npcReferences.map((npc, index) => `
-            <div class="iig-npc-item" data-index="${index}">
-                <img src="${npc.imageDataUrl}" class="iig-npc-thumbnail" alt="${npc.name}">
-                <span class="iig-npc-name">${npc.name}</span>
-                <div class="iig-npc-delete menu_button fa-solid fa-trash" data-index="${index}" title="Удалить"></div>
-            </div>
-        `).join('');
-    };
+    return settings.npcReferences.map((npc, index) => `
+        <div class="iig-npc-item" data-index="${index}">
+            <img src="${npc.imageDataUrl}" class="iig-npc-thumbnail" alt="${npc.name}">
+            <span class="iig-npc-name" title="${npc.name}">${npc.name}</span>
+            <div class="iig-npc-delete menu_button fa-solid fa-xmark" data-index="${index}" title="Удалить"></div>
+        </div>
+    `).join('');
+};
 
     const html = `
         <div class="inline-drawer">
@@ -1758,33 +1758,27 @@ function createSettingsUI() {
                     <hr>
 
                     <!-- NPC References -->
-                    <h4>NPC Референсы</h4>
-                    <p class="hint">Добавьте NPC с именем и картинкой. Когда имя NPC появляется в промпте, его референс автоматически добавляется.</p>
+<h4>NPC Референсы</h4>
+<p class="hint">Имя NPC в промпте = автоматический референс</p>
 
-                    <label class="checkbox_label">
-                        <input type="checkbox" id="iig_enable_npc_references" ${settings.enableNpcReferences ? 'checked' : ''}>
-                        <span>Включить NPC референсы</span>
-                    </label>
+<label class="checkbox_label">
+    <input type="checkbox" id="iig_enable_npc_references" ${settings.enableNpcReferences ? 'checked' : ''}>
+    <span>Включить NPC референсы</span>
+</label>
 
-                    <div id="iig_npc_section" class="${!settings.enableNpcReferences ? 'hidden' : ''}">
-                        <div class="flex-row" style="margin-top: 10px;">
-                            <input type="text" id="iig_npc_name" class="text_pole flex1" placeholder="Имя NPC">
-                            <input type="file" id="iig_npc_file" accept="image/*" style="display: none;">
-                            <div id="iig_npc_select_file" class="menu_button" title="Выбрать картинку">
-                                <i class="fa-solid fa-image"></i>
-                            </div>
-                            <div id="iig_npc_add" class="menu_button" title="Добавить NPC">
-                                <i class="fa-solid fa-plus"></i>
-                            </div>
-                        </div>
-                        <div id="iig_npc_file_name" class="hint" style="margin-top: 5px;"></div>
+<div id="iig_npc_section" class="${!settings.enableNpcReferences ? 'hidden' : ''}">
+    <div class="iig-npc-add-form">
+        <input type="text" id="iig_npc_name" class="text_pole" placeholder="Имя NPC">
+        <img id="iig_npc_preview" class="iig-npc-file-preview" src="" alt="">
+        <input type="file" id="iig_npc_file" accept="image/*" style="display: none;">
+        <div id="iig_npc_select_file" class="menu_button fa-solid fa-image" title="Картинка"></div>
+        <div id="iig_npc_add" class="menu_button fa-solid fa-plus" title="Добавить"></div>
+    </div>
 
-                        <div id="iig_npc_list" class="iig-npc-list" style="margin-top: 10px;">
-                            ${buildNpcListHtml()}
-                        </div>
-                    </div>
-
-                    <hr>
+    <div id="iig_npc_list" class="iig-npc-list">
+        ${buildNpcListHtml()}
+    </div>
+</div>
 
                     <h4>Обработка ошибок</h4>
 
@@ -2060,13 +2054,36 @@ function bindSettingsEvents(buildNpcListHtml) {
         document.getElementById('iig_npc_file')?.click();
     });
 
-    // NPC file input
-    document.getElementById('iig_npc_file')?.addEventListener('change', (e) => {
-        const file = e.target.files?.[0];
-        if (file) {
-            selectedNpcFile = file;
-            document.getElementById('iig_npc_file_name').textContent = file.name;
+// NPC file input - с превью!
+document.getElementById('iig_npc_file')?.addEventListener('change', async (e) => {
+    const file = e.target.files?.[0];
+    const preview = document.getElementById('iig_npc_preview');
+
+    if (file) {
+        selectedNpcFile = file;
+
+        // Показать превью
+        const dataUrl = await readFileAsDataUrl(file);
+        if (preview) {
+            preview.src = dataUrl;
+            preview.classList.add('has-image');
         }
+    } else {
+        selectedNpcFile = null;
+        if (preview) {
+            preview.src = '';
+            preview.classList.remove('has-image');
+        }
+    }
+});
+
+// После успешного добавления NPC - очистить превью:
+// В обработчике iig_npc_add после saveSettings():
+const preview = document.getElementById('iig_npc_preview');
+if (preview) {
+    preview.src = '';
+    preview.classList.remove('has-image');
+}
     });
 
     // NPC add button
