@@ -1,7 +1,21 @@
+/**
+ * Inline Image Generation Extension for SillyTavern
+ *
+ * Catches [IMG:GEN:{json}] tags in AI messages and generates images via configured API.
+ * Supports OpenAI-compatible and Gemini-compatible (nano-banana) endpoints.
+ *
+ * Features:
+ * - Previous image references for consistency
+ * - NPC reference system (name + uploaded image)
+ * - Fixed Maximum call stack size exceeded
+ */
+
 const MODULE_NAME = 'inline_image_gen';
 
+// Track messages currently being processed to prevent duplicate processing
 const processingMessages = new Set();
 
+// Log buffer for debugging
 const logBuffer = [];
 const MAX_LOG_ENTRIES = 200;
 
@@ -36,9 +50,10 @@ function exportLogs() {
     toastr.success('Логи экспортированы', 'Генерация картинок');
 }
 
+// Default settings
 const defaultSettings = Object.freeze({
     enabled: true,
-    apiType: 'openai',
+    apiType: 'openai', // 'openai' | 'gemini' | 'naistera'
     endpoint: '',
     apiKey: '',
     model: '',
@@ -46,34 +61,42 @@ const defaultSettings = Object.freeze({
     quality: 'standard',
     maxRetries: 0,
     retryDelay: 1000,
+    // Nano-banana specific
     sendCharAvatar: false,
     sendUserAvatar: false,
     userAvatarFile: '',
     aspectRatio: '1:1',
     imageSize: '1K',
+    // Naistera specific
     naisteraAspectRatio: '1:1',
     naisteraPreset: '',
     naisteraSendCharAvatar: false,
     naisteraSendUserAvatar: false,
-    sendPreviousImages: true,
-    maxPreviousImages: 2,
-    sendStyleReference: true,
-    sendNpcReferences: true,
-    npcReferenceImages: {},
+    // Previous image references
+    sendPreviousImages: false,
+    previousImagesCount: 2, // How many previous images to send as reference
+    // NPC references - stored as { name: string, imageDataUrl: string }[]
+    npcReferences: [],
+    enableNpcReferences: false,
 });
 
+// Image model detection keywords
 const IMAGE_MODEL_KEYWORDS = [
     'dall-e', 'midjourney', 'mj', 'journey', 'stable-diffusion', 'sdxl', 'flux',
     'imagen', 'drawing', 'paint', 'image', 'seedream', 'hidream', 'dreamshaper',
     'ideogram', 'nano-banana', 'gpt-image', 'wanx', 'qwen'
 ];
 
+// Video model keywords to exclude
 const VIDEO_MODEL_KEYWORDS = [
     'sora', 'kling', 'jimeng', 'veo', 'pika', 'runway', 'luma',
     'video', 'gen-3', 'minimax', 'cogvideo', 'mochi', 'seedance',
     'vidu', 'wan-ai', 'hunyuan', 'hailuo'
 ];
 
+/**
+ * Check if model ID is an image generation model
+ */
 function isImageModel(modelId) {
     const mid = modelId.toLowerCase();
 
@@ -90,11 +113,17 @@ function isImageModel(modelId) {
     return false;
 }
 
+/**
+ * Check if model is Gemini/nano-banana type
+ */
 function isGeminiModel(modelId) {
     const mid = modelId.toLowerCase();
     return mid.includes('nano-banana');
 }
 
+/**
+ * Get extension settings
+ */
 function getSettings() {
     const context = SillyTavern.getContext();
 
@@ -111,11 +140,17 @@ function getSettings() {
     return context.extensionSettings[MODULE_NAME];
 }
 
+/**
+ * Save settings
+ */
 function saveSettings() {
     const context = SillyTavern.getContext();
     context.saveSettingsDebounced();
 }
 
+/**
+ * Fetch models list from endpoint
+ */
 async function fetchModels() {
     const settings = getSettings();
 
@@ -149,6 +184,9 @@ async function fetchModels() {
     }
 }
 
+/**
+ * Fetch list of user avatars from /User Avatars/ directory
+ */
 async function fetchUserAvatars() {
     try {
         const context = SillyTavern.getContext();
@@ -168,15 +206,20 @@ async function fetchUserAvatars() {
     }
 }
 
+/**
+ * Convert image URL to base64 using FileReader (FIXED: no stack overflow)
+ */
 async function imageUrlToBase64(url) {
     try {
         const response = await fetch(url);
         const blob = await response.blob();
 
-        return new Promise((resolve, reject) => {
+        return await new Promise((resolve, reject) => {
             const reader = new FileReader();
             reader.onloadend = () => {
-                const base64 = reader.result.split(',')[1];
+                // Remove data URL prefix to get pure base64
+                const result = reader.result;
+                const base64 = result.split(',')[1];
                 resolve(base64);
             };
             reader.onerror = reject;
@@ -188,6 +231,9 @@ async function imageUrlToBase64(url) {
     }
 }
 
+/**
+ * Convert image URL to data URL using FileReader (FIXED: no stack overflow)
+ */
 async function imageUrlToDataUrl(url) {
     try {
         const response = await fetch(url);
@@ -205,33 +251,54 @@ async function imageUrlToDataUrl(url) {
     }
 }
 
+/**
+ * Save base64 image to file via SillyTavern API (FIXED: FileReader instead of spread)
+ * @param {string} dataUrl - Data URL (data:image/png;base64,...) or URL
+ * @returns {Promise<string>} - Relative path to saved file
+ */
 async function saveImageToFile(dataUrl) {
     const context = SillyTavern.getContext();
 
+    // If it's a URL, convert to data URL first using FileReader
     if (dataUrl && !dataUrl.startsWith('data:') && (dataUrl.startsWith('http://') || dataUrl.startsWith('https://'))) {
-        iigLog('INFO', 'Converting external URL to data URL via FileReader...');
-        const converted = await imageUrlToDataUrl(dataUrl);
-        if (!converted) {
-            throw new Error('Failed to convert external URL to data URL');
+        iigLog('INFO', 'Downloading image from URL...');
+        try {
+            const response = await fetch(dataUrl);
+            const blob = await response.blob();
+
+            // FIX: Use FileReader instead of spread on huge array
+            dataUrl = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+            });
+
+            iigLog('INFO', 'Converted URL to data URL via FileReader');
+        } catch (err) {
+            console.error('[IIG] Failed to download image:', err);
+            throw new Error('Failed to download image from URL');
         }
-        dataUrl = converted;
     }
 
+    // Extract base64 and format from data URL without regex on huge string
     const commaIndex = dataUrl.indexOf(',');
-    if (commaIndex === -1 || !dataUrl.startsWith('data:image/')) {
+    if (commaIndex === -1) {
         throw new Error('Invalid data URL format');
     }
 
-    const metaPart = dataUrl.substring(0, commaIndex);
+    const metaPart = dataUrl.substring(0, commaIndex); // "data:image/png;base64"
     const formatMatch = metaPart.match(/image\/(\w+)/);
     const format = formatMatch ? formatMatch[1] : 'png';
     const base64Data = dataUrl.substring(commaIndex + 1);
 
+    // Get character name for subfolder
     let charName = 'generated';
     if (context.characterId !== undefined && context.characters?.[context.characterId]) {
         charName = context.characters[context.characterId].name || 'generated';
     }
 
+    // Generate unique filename
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const filename = `iig_${timestamp}`;
 
@@ -252,10 +319,13 @@ async function saveImageToFile(dataUrl) {
     }
 
     const result = await response.json();
-    iigLog('INFO', `Image saved to: ${result.path}`);
+    iigLog('INFO', 'Image saved to:', result.path);
     return result.path;
 }
 
+/**
+ * Get character avatar as base64
+ */
 async function getCharacterAvatarBase64() {
     try {
         const context = SillyTavern.getContext();
@@ -284,6 +354,9 @@ async function getCharacterAvatarBase64() {
     }
 }
 
+/**
+ * Get character avatar as data URL
+ */
 async function getCharacterAvatarDataUrl() {
     try {
         const context = SillyTavern.getContext();
@@ -312,6 +385,9 @@ async function getCharacterAvatarDataUrl() {
     }
 }
 
+/**
+ * Get user avatar as base64
+ */
 async function getUserAvatarBase64() {
     try {
         const settings = getSettings();
@@ -328,6 +404,9 @@ async function getUserAvatarBase64() {
     }
 }
 
+/**
+ * Get user avatar as data URL
+ */
 async function getUserAvatarDataUrl() {
     try {
         const settings = getSettings();
@@ -342,81 +421,157 @@ async function getUserAvatarDataUrl() {
     }
 }
 
-async function collectReferenceImages(prompt, currentMessageId) {
+/**
+ * Get previously generated images from chat as references
+ * @param {number} count - How many images to get
+ * @returns {Promise<string[]>} - Array of base64 strings
+ */
+async function getPreviousGeneratedImages(count = 2) {
     const context = SillyTavern.getContext();
-    const settings = getSettings();
-    const result = { previous: [], style: null, npcs: [] };
+    const references = [];
 
     if (!context.chat || context.chat.length === 0) {
-        return result;
+        return references;
     }
 
-    const generatedImages = [];
-
-    for (let i = context.chat.length - 1; i >= 0; i--) {
-        if (i === currentMessageId) continue;
-
+    // Search from newest to oldest
+    for (let i = context.chat.length - 1; i >= 0 && references.length < count; i--) {
         const message = context.chat[i];
-        if (!message || !message.mes) continue;
+        if (!message.mes) continue;
 
-        const imgPathRegex = /src=["']?(\/user\/images\/[^"'\s>]+)["']?/gi;
+        // Find generated image paths in message
+        // Look for src="/user/images/..." pattern (our saved images)
+        const imgPathRegex = /src=["']?(\/user\/images\/[^"'\s>]+)/gi;
         let match;
 
-        while ((match = imgPathRegex.exec(message.mes)) !== null) {
-            const imgPath = match[1];
-            if (imgPath.includes('iig_')) {
-                generatedImages.push({
-                    path: imgPath,
-                    messageIndex: i
-                });
-            }
-        }
-    }
+        while ((match = imgPathRegex.exec(message.mes)) !== null && references.length < count) {
+            const imagePath = match[1];
 
-    iigLog('INFO', `Found ${generatedImages.length} previously generated images in chat history`);
+            // Skip error images
+            if (imagePath.includes('error.svg')) continue;
 
-    if (settings.sendStyleReference && generatedImages.length > 0) {
-        const oldestImage = generatedImages[generatedImages.length - 1];
-        const styleDataUrl = await imageUrlToDataUrl(oldestImage.path);
-        if (styleDataUrl) {
-            result.style = styleDataUrl;
-            iigLog('INFO', `Style reference: ${oldestImage.path}`);
-        }
-    }
-
-    if (settings.sendPreviousImages && generatedImages.length > 0) {
-        const maxPrev = Math.min(settings.maxPreviousImages || 2, 4);
-        const endIdx = Math.min(maxPrev, generatedImages.length - (result.style ? 1 : 0));
-
-        for (let i = 0; i < endIdx; i++) {
-            const imgPath = generatedImages[i].path;
-            const dataUrl = await imageUrlToDataUrl(imgPath);
-            if (dataUrl) {
-                result.previous.push(dataUrl);
-            }
-        }
-        iigLog('INFO', `Previous references: ${result.previous.length} images`);
-    }
-
-    if (settings.sendNpcReferences && settings.npcReferenceImages) {
-        const promptLower = prompt.toLowerCase();
-
-        for (const [npcName, npcImagePath] of Object.entries(settings.npcReferenceImages)) {
-            if (!npcImagePath) continue;
-
-            if (promptLower.includes(npcName.toLowerCase())) {
-                const npcDataUrl = await imageUrlToDataUrl(npcImagePath);
-                if (npcDataUrl) {
-                    result.npcs.push(npcDataUrl);
-                    iigLog('INFO', `NPC reference found: ${npcName} -> ${npcImagePath}`);
+            try {
+                const base64 = await imageUrlToBase64(imagePath);
+                if (base64) {
+                    references.push(base64);
+                    iigLog('INFO', `Added previous image as reference: ${imagePath.substring(0, 50)}`);
                 }
+            } catch (e) {
+                iigLog('WARN', `Failed to load previous image: ${imagePath}`);
             }
         }
     }
 
-    return result;
+    iigLog('INFO', `Collected ${references.length} previous image references`);
+    return references;
 }
 
+/**
+ * Get previously generated images as data URLs (for Naistera)
+ */
+async function getPreviousGeneratedImagesDataUrls(count = 2) {
+    const context = SillyTavern.getContext();
+    const references = [];
+
+    if (!context.chat || context.chat.length === 0) {
+        return references;
+    }
+
+    for (let i = context.chat.length - 1; i >= 0 && references.length < count; i--) {
+        const message = context.chat[i];
+        if (!message.mes) continue;
+
+        const imgPathRegex = /src=["']?(\/user\/images\/[^"'\s>]+)/gi;
+        let match;
+
+        while ((match = imgPathRegex.exec(message.mes)) !== null && references.length < count) {
+            const imagePath = match[1];
+            if (imagePath.includes('error.svg')) continue;
+
+            try {
+                const dataUrl = await imageUrlToDataUrl(imagePath);
+                if (dataUrl) {
+                    references.push(dataUrl);
+                }
+            } catch (e) {
+                iigLog('WARN', `Failed to load previous image as data URL: ${imagePath}`);
+            }
+        }
+    }
+
+    return references;
+}
+
+/**
+ * Find NPC references that match names in the prompt
+ * @param {string} prompt - The image generation prompt
+ * @returns {Promise<{name: string, base64: string}[]>} - Matching NPC references
+ */
+async function findMatchingNpcReferences(prompt) {
+    const settings = getSettings();
+
+    if (!settings.enableNpcReferences || !settings.npcReferences || settings.npcReferences.length === 0) {
+        return [];
+    }
+
+    const matches = [];
+    const promptLower = prompt.toLowerCase();
+
+    for (const npc of settings.npcReferences) {
+        if (!npc.name || !npc.imageDataUrl) continue;
+
+        // Check if NPC name appears in prompt (case-insensitive)
+        const nameLower = npc.name.toLowerCase();
+        if (promptLower.includes(nameLower)) {
+            // Convert data URL to base64
+            const commaIndex = npc.imageDataUrl.indexOf(',');
+            const base64 = commaIndex !== -1 ? npc.imageDataUrl.substring(commaIndex + 1) : null;
+
+            if (base64) {
+                matches.push({
+                    name: npc.name,
+                    base64: base64
+                });
+                iigLog('INFO', `Found NPC reference match: ${npc.name}`);
+            }
+        }
+    }
+
+    return matches;
+}
+
+/**
+ * Find NPC references as data URLs (for Naistera)
+ */
+async function findMatchingNpcReferencesDataUrls(prompt) {
+    const settings = getSettings();
+
+    if (!settings.enableNpcReferences || !settings.npcReferences || settings.npcReferences.length === 0) {
+        return [];
+    }
+
+    const matches = [];
+    const promptLower = prompt.toLowerCase();
+
+    for (const npc of settings.npcReferences) {
+        if (!npc.name || !npc.imageDataUrl) continue;
+
+        const nameLower = npc.name.toLowerCase();
+        if (promptLower.includes(nameLower)) {
+            matches.push({
+                name: npc.name,
+                dataUrl: npc.imageDataUrl
+            });
+            iigLog('INFO', `Found NPC reference match (data URL): ${npc.name}`);
+        }
+    }
+
+    return matches;
+}
+
+/**
+ * Generate image via OpenAI-compatible endpoint
+ */
 async function generateImageOpenAI(prompt, style, referenceImages = [], options = {}) {
     const settings = getSettings();
     const url = `${settings.endpoint.replace(/\/$/, '')}/v1/images/generations`;
@@ -474,9 +629,13 @@ async function generateImageOpenAI(prompt, style, referenceImages = [], options 
     return imageObj.url;
 }
 
+// Valid aspect ratios for Gemini/nano-banana
 const VALID_ASPECT_RATIOS = ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'];
 const VALID_IMAGE_SIZES = ['1K', '2K', '4K'];
 
+/**
+ * Generate image via Gemini-compatible endpoint (nano-banana)
+ */
 async function generateImageGemini(prompt, style, referenceImages = [], options = {}) {
     const settings = getSettings();
     const model = settings.model;
@@ -496,6 +655,7 @@ async function generateImageGemini(prompt, style, referenceImages = [], options 
 
     const parts = [];
 
+    // Add reference images first (up to 4)
     for (const imgB64 of referenceImages.slice(0, 4)) {
         parts.push({
             inlineData: {
@@ -508,21 +668,8 @@ async function generateImageGemini(prompt, style, referenceImages = [], options 
     let fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
 
     if (referenceImages.length > 0) {
-        const refInstruction = `[CRITICAL REFERENCE INSTRUCTIONS:
-You are provided with ${referenceImages.length} reference image(s). These MUST be used as follows:
-- Reference 1: This is the PRIMARY STYLE/CHARACTER reference. Copy the exact art style, color palette, lighting, and if a character - their complete appearance (face, hair, body, clothing).
-${referenceImages.length >= 2 ? '- Reference 2+: Additional character references or previous images from this scene. Maintain EXACT visual consistency with these.' : ''}
-
-MANDATORY:
-- Match the art style EXACTLY (brushwork, colors, rendering technique)
-- Character faces MUST look identical to references
-- Clothing and accessories MUST match unless explicitly changed in prompt
-- Maintain the same level of detail and quality
-
-DO NOT: Create generic/different looking characters. Every named character MUST match their reference exactly.]
-
-`;
-        fullPrompt = refInstruction + fullPrompt;
+        const refInstruction = `[CRITICAL: The reference image(s) above show the EXACT appearance of the character(s). You MUST precisely copy their: face structure, eye color, hair color and style, skin tone, body type, clothing, and all distinctive features. Do not deviate from the reference appearances.]`;
+        fullPrompt = `${refInstruction}\n\n${fullPrompt}`;
     }
 
     parts.push({ text: fullPrompt });
@@ -578,6 +725,9 @@ DO NOT: Create generic/different looking characters. Every named character MUST 
     throw new Error('No image found in Gemini response');
 }
 
+/**
+ * Generate image via Naistera custom endpoint
+ */
 async function generateImageNaistera(prompt, style, options = {}) {
     const settings = getSettings();
     const endpoint = settings.endpoint.replace(/\/$/, '');
@@ -618,6 +768,9 @@ async function generateImageNaistera(prompt, style, options = {}) {
     return result.data_url;
 }
 
+/**
+ * Validate settings before generation
+ */
 function validateSettings() {
     const settings = getSettings();
     const errors = [];
@@ -637,12 +790,9 @@ function validateSettings() {
     }
 }
 
-function sanitizeForHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-}
-
+/**
+ * Generate image with retry logic and reference collection
+ */
 async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {}) {
     validateSettings();
 
@@ -650,64 +800,68 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
     const maxRetries = settings.maxRetries;
     const baseDelay = settings.retryDelay;
 
-    const referenceImages = [];
-    const referenceDataUrls = [];
+    // Collect all reference images
+    const referenceImages = []; // base64 for Gemini/OpenAI
+    const referenceDataUrls = []; // data URLs for Naistera
 
-    onStatusUpdate?.('Сбор референсов...');
-    const chatRefs = await collectReferenceImages(prompt, options.messageId);
+    const isGemini = settings.apiType === 'gemini' || isGeminiModel(settings.model);
+    const isNaistera = settings.apiType === 'naistera';
 
-    if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
-        if (settings.sendCharAvatar) {
-            const charAvatar = await getCharacterAvatarBase64();
-            if (charAvatar) referenceImages.push(charAvatar);
-        }
-        if (settings.sendUserAvatar) {
-            const userAvatar = await getUserAvatarBase64();
-            if (userAvatar) referenceImages.push(userAvatar);
-        }
-
-        if (chatRefs.style) {
-            const styleB64 = chatRefs.style.split(',')[1];
-            if (styleB64) referenceImages.push(styleB64);
-        }
-
-        for (const prevDataUrl of chatRefs.previous) {
-            if (referenceImages.length >= 4) break;
-            const b64 = prevDataUrl.split(',')[1];
-            if (b64) referenceImages.push(b64);
-        }
-
-        for (const npcDataUrl of chatRefs.npcs) {
-            if (referenceImages.length >= 4) break;
-            const b64 = npcDataUrl.split(',')[1];
-            if (b64) referenceImages.push(b64);
-        }
-
-        iigLog('INFO', `Total Gemini references: ${referenceImages.length}`);
+    // 1. Character avatar
+    if (isGemini && settings.sendCharAvatar) {
+        const charAvatar = await getCharacterAvatarBase64();
+        if (charAvatar) referenceImages.push(charAvatar);
+    }
+    if (isNaistera && settings.naisteraSendCharAvatar) {
+        const d = await getCharacterAvatarDataUrl();
+        if (d) referenceDataUrls.push(d);
     }
 
-    if (settings.apiType === 'naistera') {
-        if (settings.naisteraSendCharAvatar) {
-            const d = await getCharacterAvatarDataUrl();
-            if (d) referenceDataUrls.push(d);
-        }
-        if (settings.naisteraSendUserAvatar) {
-            const d = await getUserAvatarDataUrl();
-            if (d) referenceDataUrls.push(d);
-        }
-
-        if (chatRefs.style) referenceDataUrls.push(chatRefs.style);
-        for (const prev of chatRefs.previous) {
-            if (referenceDataUrls.length >= 4) break;
-            referenceDataUrls.push(prev);
-        }
-        for (const npc of chatRefs.npcs) {
-            if (referenceDataUrls.length >= 4) break;
-            referenceDataUrls.push(npc);
-        }
-
-        iigLog('INFO', `Total Naistera references: ${referenceDataUrls.length}`);
+    // 2. User avatar
+    if (isGemini && settings.sendUserAvatar) {
+        const userAvatar = await getUserAvatarBase64();
+        if (userAvatar) referenceImages.push(userAvatar);
     }
+    if (isNaistera && settings.naisteraSendUserAvatar) {
+        const d = await getUserAvatarDataUrl();
+        if (d) referenceDataUrls.push(d);
+    }
+
+    // 3. Previous generated images
+    if (settings.sendPreviousImages && settings.previousImagesCount > 0) {
+        onStatusUpdate?.('Загрузка предыдущих картинок...');
+
+        if (isGemini) {
+            const prevImages = await getPreviousGeneratedImages(settings.previousImagesCount);
+            referenceImages.push(...prevImages);
+        }
+        if (isNaistera) {
+            const prevDataUrls = await getPreviousGeneratedImagesDataUrls(settings.previousImagesCount);
+            referenceDataUrls.push(...prevDataUrls);
+        }
+    }
+
+    // 4. NPC references (matched by name in prompt)
+    if (settings.enableNpcReferences) {
+        onStatusUpdate?.('Поиск NPC референсов...');
+
+        if (isGemini) {
+            const npcMatches = await findMatchingNpcReferences(prompt);
+            for (const npc of npcMatches) {
+                referenceImages.push(npc.base64);
+                iigLog('INFO', `Adding NPC reference for: ${npc.name}`);
+            }
+        }
+        if (isNaistera) {
+            const npcMatches = await findMatchingNpcReferencesDataUrls(prompt);
+            for (const npc of npcMatches) {
+                referenceDataUrls.push(npc.dataUrl);
+                iigLog('INFO', `Adding NPC reference (data URL) for: ${npc.name}`);
+            }
+        }
+    }
+
+    iigLog('INFO', `Total references collected: ${referenceImages.length} base64, ${referenceDataUrls.length} data URLs`);
 
     let lastError;
 
@@ -715,16 +869,16 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
         try {
             onStatusUpdate?.(`Генерация${attempt > 0 ? ` (повтор ${attempt}/${maxRetries})` : ''}...`);
 
-            if (settings.apiType === 'naistera') {
+            if (isNaistera) {
                 return await generateImageNaistera(prompt, style, { ...options, referenceImages: referenceDataUrls });
-            } else if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
+            } else if (isGemini) {
                 return await generateImageGemini(prompt, style, referenceImages, options);
             } else {
                 return await generateImageOpenAI(prompt, style, referenceImages, options);
             }
         } catch (error) {
             lastError = error;
-            iigLog('ERROR', `Generation attempt ${attempt + 1} failed:`, error.message);
+            console.error(`[IIG] Generation attempt ${attempt + 1} failed:`, error);
 
             const isRetryable = error.message?.includes('429') ||
                                error.message?.includes('503') ||
@@ -746,6 +900,9 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
     throw lastError;
 }
 
+/**
+ * Check if a file exists on the server
+ */
 async function checkFileExists(path) {
     try {
         const response = await fetch(path, { method: 'HEAD' });
@@ -755,10 +912,14 @@ async function checkFileExists(path) {
     }
 }
 
+/**
+ * Parse image generation tags from message text
+ */
 async function parseImageTags(text, options = {}) {
     const { checkExistence = false, forceAll = false } = options;
     const tags = [];
 
+    // === NEW FORMAT: <img data-iig-instruction="{...}" src="[IMG:GEN]"> ===
     const imgTagMarker = 'data-iig-instruction=';
     let searchPos = 0;
 
@@ -850,7 +1011,6 @@ async function parseImageTags(text, options = {}) {
         } else if (hasPath && checkExistence) {
             const exists = await checkFileExists(srcValue);
             if (!exists) {
-                iigLog('WARN', `File does not exist (LLM hallucination?): ${srcValue}`);
                 needsGeneration = true;
             }
         } else if (hasPath) {
@@ -885,8 +1045,6 @@ async function parseImageTags(text, options = {}) {
                 isNewFormat: true,
                 existingSrc: hasPath ? srcValue : null
             });
-
-            iigLog('INFO', `Found NEW format tag: ${data.prompt?.substring(0, 50)}`);
         } catch (e) {
             iigLog('WARN', `Failed to parse instruction JSON: ${instructionJson.substring(0, 100)}`, e.message);
         }
@@ -894,6 +1052,7 @@ async function parseImageTags(text, options = {}) {
         searchPos = imgEnd;
     }
 
+    // === LEGACY FORMAT: [IMG:GEN:{...}] ===
     const marker = '[IMG:GEN:';
     let searchStart = 0;
 
@@ -969,8 +1128,6 @@ async function parseImageTags(text, options = {}) {
                 quality: data.quality || null,
                 isNewFormat: false
             });
-
-            iigLog('INFO', `Found LEGACY format tag: ${data.prompt?.substring(0, 50)}`);
         } catch (e) {
             iigLog('WARN', `Failed to parse legacy tag JSON: ${jsonStr.substring(0, 100)}`, e.message);
         }
@@ -981,6 +1138,9 @@ async function parseImageTags(text, options = {}) {
     return tags;
 }
 
+/**
+ * Create loading placeholder element
+ */
 function createLoadingPlaceholder(tagId) {
     const placeholder = document.createElement('div');
     placeholder.className = 'iig-loading-placeholder';
@@ -994,6 +1154,9 @@ function createLoadingPlaceholder(tagId) {
 
 const ERROR_IMAGE_PATH = '/scripts/extensions/third-party/sillyimages/error.svg';
 
+/**
+ * Create error placeholder element
+ */
 function createErrorPlaceholder(tagId, errorMessage, tagInfo) {
     const img = document.createElement('img');
     img.className = 'iig-error-image';
@@ -1012,6 +1175,9 @@ function createErrorPlaceholder(tagId, errorMessage, tagInfo) {
     return img;
 }
 
+/**
+ * Process image tags in a message
+ */
 async function processMessageTags(messageId) {
     const context = SillyTavern.getContext();
     const settings = getSettings();
@@ -1027,9 +1193,8 @@ async function processMessageTags(messageId) {
     if (!message || message.is_user) return;
 
     const tags = await parseImageTags(message.mes, { checkExistence: true });
-    iigLog('INFO', `parseImageTags returned: ${tags.length} tags`);
+
     if (tags.length === 0) {
-        iigLog('INFO', 'No tags found by parser');
         return;
     }
 
@@ -1039,9 +1204,7 @@ async function processMessageTags(messageId) {
 
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
     if (!messageElement) {
-        console.error('[IIG] Message element not found for ID:', messageId);
         processingMessages.delete(messageId);
-        toastr.error('Не удалось найти элемент сообщения', 'Генерация картинок');
         return;
     }
 
@@ -1053,8 +1216,6 @@ async function processMessageTags(messageId) {
 
     const processTag = async (tag, index) => {
         const tagId = `iig-${messageId}-${index}`;
-
-        iigLog('INFO', `Processing tag ${index}: ${tag.fullMatch.substring(0, 50)}`);
 
         const loadingPlaceholder = createLoadingPlaceholder(tagId);
         let targetElement = null;
@@ -1170,7 +1331,7 @@ async function processMessageTags(messageId) {
                 tag.prompt,
                 tag.style,
                 (status) => { statusEl.textContent = status; },
-                { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, messageId: messageId }
+                { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset }
             );
 
             statusEl.textContent = 'Сохранение...';
@@ -1221,13 +1382,22 @@ async function processMessageTags(messageId) {
 
     try {
         await Promise.all(tags.map((tag, index) => processTag(tag, index)));
+
+        // Save chat BEFORE removing from processing set
         await context.saveChat();
         iigLog('INFO', `Finished processing message ${messageId}`);
     } finally {
+        // Remove from processing set AFTER saveChat
         processingMessages.delete(messageId);
     }
+
+    // REMOVED: Re-render via innerHTML - causes potential loops and overwrites our DOM changes
+    // The DOM is already updated via replaceWith(), and message.mes is updated for persistence
 }
 
+/**
+ * Regenerate all images in a message
+ */
 async function regenerateMessageImages(messageId) {
     const context = SillyTavern.getContext();
     const message = context.chat[messageId];
@@ -1279,7 +1449,7 @@ async function regenerateMessageImages(messageId) {
                     tag.prompt,
                     tag.style,
                     (status) => { statusEl.textContent = status; },
-                    { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, messageId: messageId }
+                    { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset }
                 );
 
                 statusEl.textContent = 'Сохранение...';
@@ -1310,6 +1480,9 @@ async function regenerateMessageImages(messageId) {
     iigLog('INFO', `Regeneration complete for message ${messageId}`);
 }
 
+/**
+ * Add regenerate button to message
+ */
 function addRegenerateButton(messageElement, messageId) {
     if (messageElement.querySelector('.iig-regenerate-btn')) return;
 
@@ -1328,6 +1501,9 @@ function addRegenerateButton(messageElement, messageId) {
     extraMesButtons.appendChild(btn);
 }
 
+/**
+ * Add regenerate buttons to all existing AI messages
+ */
 function addButtonsToExistingMessages() {
     const context = SillyTavern.getContext();
     if (!context.chat || context.chat.length === 0) return;
@@ -1351,12 +1527,14 @@ function addButtonsToExistingMessages() {
     iigLog('INFO', `Added regenerate buttons to ${addedCount} existing messages`);
 }
 
+/**
+ * Handle CHARACTER_MESSAGE_RENDERED event
+ */
 async function onMessageReceived(messageId) {
     iigLog('INFO', `onMessageReceived: ${messageId}`);
 
     const settings = getSettings();
     if (!settings.enabled) {
-        iigLog('INFO', 'Extension disabled, skipping');
         return;
     }
 
@@ -1371,58 +1549,44 @@ async function onMessageReceived(messageId) {
     await processMessageTags(messageId);
 }
 
-function renderNpcList() {
-    const settings = getSettings();
-    const container = document.getElementById('iig_npc_list');
-    if (!container) return;
-
-    const npcs = settings.npcReferenceImages || {};
-
-    if (Object.keys(npcs).length === 0) {
-        container.innerHTML = '<p class="hint">Нет добавленных NPC</p>';
-        return;
-    }
-
-    container.innerHTML = Object.entries(npcs).map(([name, path]) => `
-        <div class="iig-npc-item flex-row" data-npc="${name}">
-            <span class="iig-npc-name">${name}</span>
-            <input type="text" class="text_pole flex1 iig-npc-path"
-                   value="${path}" placeholder="/user/images/..."
-                   data-npc="${name}">
-            <div class="menu_button iig-npc-delete" data-npc="${name}" title="Удалить">
-                <i class="fa-solid fa-trash"></i>
-            </div>
-        </div>
-    `).join('');
-
-    container.querySelectorAll('.iig-npc-path').forEach(input => {
-        input.addEventListener('input', (e) => {
-            const npcName = e.target.dataset.npc;
-            settings.npcReferenceImages[npcName] = e.target.value;
-            saveSettings();
-        });
-    });
-
-    container.querySelectorAll('.iig-npc-delete').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-            const npcName = e.currentTarget.dataset.npc;
-            delete settings.npcReferenceImages[npcName];
-            saveSettings();
-            renderNpcList();
-            toastr.info(`NPC "${npcName}" удалён`, 'Генерация картинок');
-        });
+/**
+ * Read file as data URL
+ */
+function readFileAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
     });
 }
 
+/**
+ * Create settings UI
+ */
 function createSettingsUI() {
     const settings = getSettings();
-    const context = SillyTavern.getContext();
 
     const container = document.getElementById('extensions_settings');
     if (!container) {
         console.error('[IIG] Settings container not found');
         return;
     }
+
+    // Build NPC list HTML
+    const buildNpcListHtml = () => {
+        if (!settings.npcReferences || settings.npcReferences.length === 0) {
+            return '<p class="hint">Нет добавленных NPC</p>';
+        }
+
+        return settings.npcReferences.map((npc, index) => `
+            <div class="iig-npc-item" data-index="${index}">
+                <img src="${npc.imageDataUrl}" class="iig-npc-thumbnail" alt="${npc.name}">
+                <span class="iig-npc-name">${npc.name}</span>
+                <div class="iig-npc-delete menu_button fa-solid fa-trash" data-index="${index}" title="Удалить"></div>
+            </div>
+        `).join('');
+    };
 
     const html = `
         <div class="inline-drawer">
@@ -1432,6 +1596,7 @@ function createSettingsUI() {
             </div>
             <div class="inline-drawer-content">
                 <div class="iig-settings">
+                    <!-- Enable/Disable -->
                     <label class="checkbox_label">
                         <input type="checkbox" id="iig_enabled" ${settings.enabled ? 'checked' : ''}>
                         <span>Включить генерацию картинок</span>
@@ -1441,15 +1606,17 @@ function createSettingsUI() {
 
                     <h4>Настройки API</h4>
 
+                    <!-- API Type -->
                     <div class="flex-row">
                         <label for="iig_api_type">Тип API</label>
                         <select id="iig_api_type" class="flex1">
-                            <option value="openai" ${settings.apiType === 'openai' ? 'selected' : ''}>OpenAI-совместимый (/v1/images/generations)</option>
-                            <option value="gemini" ${settings.apiType === 'gemini' ? 'selected' : ''}>Gemini-совместимый (nano-banana)</option>
-                            <option value="naistera" ${settings.apiType === 'naistera' ? 'selected' : ''}>Naistera/Grok (naistera.org)</option>
+                            <option value="openai" ${settings.apiType === 'openai' ? 'selected' : ''}>OpenAI-совместимый</option>
+                            <option value="gemini" ${settings.apiType === 'gemini' ? 'selected' : ''}>Gemini (nano-banana)</option>
+                            <option value="naistera" ${settings.apiType === 'naistera' ? 'selected' : ''}>Naistera/Grok</option>
                         </select>
                     </div>
 
+                    <!-- Endpoint -->
                     <div class="flex-row">
                         <label for="iig_endpoint">URL эндпоинта</label>
                         <input type="text" id="iig_endpoint" class="text_pole flex1"
@@ -1457,6 +1624,7 @@ function createSettingsUI() {
                                placeholder="https://api.example.com">
                     </div>
 
+                    <!-- API Key -->
                     <div class="flex-row">
                         <label for="iig_api_key">API ключ</label>
                         <input type="password" id="iig_api_key" class="text_pole flex1"
@@ -1465,14 +1633,15 @@ function createSettingsUI() {
                             <i class="fa-solid fa-eye"></i>
                         </div>
                     </div>
-                    <p id="iig_naistera_hint" class="hint ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}">Для Naistera/Grok: вставьте токен из Telegram бота. Модель не требуется.</p>
+                    <p id="iig_naistera_hint" class="hint ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}">Для Naistera/Grok: токен из Telegram бота.</p>
 
+                    <!-- Model -->
                     <div class="flex-row ${settings.apiType === 'naistera' ? 'iig-hidden' : ''}" id="iig_model_row">
                         <label for="iig_model">Модель</label>
                         <select id="iig_model" class="flex1">
-                            ${settings.model ? `<option value="${settings.model}" selected>${settings.model}</option>` : '<option value="">-- Выберите модель --</option>'}
+                            ${settings.model ? `<option value="${settings.model}" selected>${settings.model}</option>` : '<option value="">-- Выберите --</option>'}
                         </select>
-                        <div id="iig_refresh_models" class="menu_button iig-refresh-btn" title="Обновить список">
+                        <div id="iig_refresh_models" class="menu_button iig-refresh-btn" title="Обновить">
                             <i class="fa-solid fa-sync"></i>
                         </div>
                     </div>
@@ -1481,16 +1650,17 @@ function createSettingsUI() {
 
                     <h4>Параметры генерации</h4>
 
+                    <!-- OpenAI Size -->
                     <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_size_row">
                         <label for="iig_size">Размер</label>
                         <select id="iig_size" class="flex1">
-                            <option value="1024x1024" ${settings.size === '1024x1024' ? 'selected' : ''}>1024x1024 (Квадрат)</option>
-                            <option value="1792x1024" ${settings.size === '1792x1024' ? 'selected' : ''}>1792x1024 (Альбомная)</option>
-                            <option value="1024x1792" ${settings.size === '1024x1792' ? 'selected' : ''}>1024x1792 (Портретная)</option>
-                            <option value="512x512" ${settings.size === '512x512' ? 'selected' : ''}>512x512 (Маленький)</option>
+                            <option value="1024x1024" ${settings.size === '1024x1024' ? 'selected' : ''}>1024x1024</option>
+                            <option value="1792x1024" ${settings.size === '1792x1024' ? 'selected' : ''}>1792x1024</option>
+                            <option value="1024x1792" ${settings.size === '1024x1792' ? 'selected' : ''}>1024x1792</option>
                         </select>
                     </div>
 
+                    <!-- OpenAI Quality -->
                     <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_quality_row">
                         <label for="iig_quality">Качество</label>
                         <select id="iig_quality" class="flex1">
@@ -1499,8 +1669,9 @@ function createSettingsUI() {
                         </select>
                     </div>
 
+                    <!-- Naistera params -->
                     <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_aspect_row">
-                        <label for="iig_naistera_aspect_ratio">Соотношение сторон</label>
+                        <label for="iig_naistera_aspect_ratio">Соотношение</label>
                         <select id="iig_naistera_aspect_ratio" class="flex1">
                             <option value="1:1" ${settings.naisteraAspectRatio === '1:1' ? 'selected' : ''}>1:1</option>
                             <option value="3:2" ${settings.naisteraAspectRatio === '3:2' ? 'selected' : ''}>3:2</option>
@@ -1508,7 +1679,7 @@ function createSettingsUI() {
                         </select>
                     </div>
                     <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_preset_row">
-                        <label for="iig_naistera_preset">Пресеты</label>
+                        <label for="iig_naistera_preset">Пресет</label>
                         <select id="iig_naistera_preset" class="flex1">
                             <option value="" ${!settings.naisteraPreset ? 'selected' : ''}>без пресета</option>
                             <option value="digital" ${settings.naisteraPreset === 'digital' ? 'selected' : ''}>digital</option>
@@ -1516,121 +1687,100 @@ function createSettingsUI() {
                         </select>
                     </div>
 
-                    <div class="iig-naistera-refs ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_refs_section">
-                        <h4>Референсы Naistera</h4>
-                        <p class="hint">Отправлять аватарки как референсы для консистентной генерации персонажей.</p>
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_naistera_send_char_avatar" ${settings.naisteraSendCharAvatar ? 'checked' : ''}>
-                            <span>Отправлять аватар персонажа</span>
-                        </label>
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_naistera_send_user_avatar" ${settings.naisteraSendUserAvatar ? 'checked' : ''}>
-                            <span>Отправлять аватар пользователя</span>
-                        </label>
-
-                        <div id="iig_naistera_user_avatar_row" class="flex-row ${!settings.naisteraSendUserAvatar ? 'iig-hidden' : ''}" style="margin-top: 5px;">
-                            <label for="iig_naistera_user_avatar_file">Аватар пользователя</label>
-                            <select id="iig_naistera_user_avatar_file" class="flex1">
-                                <option value="">-- Не выбран --</option>
-                                ${settings.userAvatarFile ? `<option value="${settings.userAvatarFile}" selected>${settings.userAvatarFile}</option>` : ''}
-                            </select>
-                            <div id="iig_naistera_refresh_avatars" class="menu_button iig-refresh-btn" title="Обновить список">
-                                <i class="fa-solid fa-sync"></i>
-                            </div>
-                        </div>
-                    </div>
-
                     <hr>
 
+                    <!-- Gemini/Nano-banana settings -->
                     <div id="iig_avatar_section" class="iig-avatar-section ${settings.apiType !== 'gemini' ? 'hidden' : ''}">
                         <h4>Настройки Nano-Banana</h4>
 
                         <div class="flex-row">
-                            <label for="iig_aspect_ratio">Соотношение сторон</label>
+                            <label for="iig_aspect_ratio">Соотношение</label>
                             <select id="iig_aspect_ratio" class="flex1">
-                                <option value="1:1" ${settings.aspectRatio === '1:1' ? 'selected' : ''}>1:1 (Квадрат)</option>
-                                <option value="2:3" ${settings.aspectRatio === '2:3' ? 'selected' : ''}>2:3 (Портрет)</option>
-                                <option value="3:2" ${settings.aspectRatio === '3:2' ? 'selected' : ''}>3:2 (Альбом)</option>
-                                <option value="3:4" ${settings.aspectRatio === '3:4' ? 'selected' : ''}>3:4 (Портрет)</option>
-                                <option value="4:3" ${settings.aspectRatio === '4:3' ? 'selected' : ''}>4:3 (Альбом)</option>
-                                <option value="4:5" ${settings.aspectRatio === '4:5' ? 'selected' : ''}>4:5 (Портрет)</option>
-                                <option value="5:4" ${settings.aspectRatio === '5:4' ? 'selected' : ''}>5:4 (Альбом)</option>
-                                <option value="9:16" ${settings.aspectRatio === '9:16' ? 'selected' : ''}>9:16 (Вертикальный)</option>
-                                <option value="16:9" ${settings.aspectRatio === '16:9' ? 'selected' : ''}>16:9 (Широкий)</option>
-                                <option value="21:9" ${settings.aspectRatio === '21:9' ? 'selected' : ''}>21:9 (Ультраширокий)</option>
+                                <option value="1:1" ${settings.aspectRatio === '1:1' ? 'selected' : ''}>1:1</option>
+                                <option value="2:3" ${settings.aspectRatio === '2:3' ? 'selected' : ''}>2:3</option>
+                                <option value="3:2" ${settings.aspectRatio === '3:2' ? 'selected' : ''}>3:2</option>
+                                <option value="9:16" ${settings.aspectRatio === '9:16' ? 'selected' : ''}>9:16</option>
+                                <option value="16:9" ${settings.aspectRatio === '16:9' ? 'selected' : ''}>16:9</option>
                             </select>
                         </div>
 
                         <div class="flex-row">
                             <label for="iig_image_size">Разрешение</label>
                             <select id="iig_image_size" class="flex1">
-                                <option value="1K" ${settings.imageSize === '1K' ? 'selected' : ''}>1K (по умолчанию)</option>
+                                <option value="1K" ${settings.imageSize === '1K' ? 'selected' : ''}>1K</option>
                                 <option value="2K" ${settings.imageSize === '2K' ? 'selected' : ''}>2K</option>
                                 <option value="4K" ${settings.imageSize === '4K' ? 'selected' : ''}>4K</option>
                             </select>
                         </div>
 
                         <hr>
+                    </div>
 
-                        <h5>Референсы Nano-Banana</h5>
-                        <p class="hint">Отправлять аватарки как референсы для консистентной генерации персонажей.</p>
+                    <!-- References Section -->
+                    <h4>Референсы</h4>
+                    <p class="hint">Отправлять изображения как референсы для консистентной генерации.</p>
 
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_send_char_avatar" ${settings.sendCharAvatar ? 'checked' : ''}>
-                            <span>Отправлять аватар персонажа</span>
-                        </label>
+                    <!-- Character Avatar -->
+                    <label class="checkbox_label">
+                        <input type="checkbox" id="iig_send_char_avatar" ${settings.sendCharAvatar ? 'checked' : ''}>
+                        <span>Аватар персонажа</span>
+                    </label>
 
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_send_user_avatar" ${settings.sendUserAvatar ? 'checked' : ''}>
-                            <span>Отправлять аватар пользователя</span>
-                        </label>
+                    <!-- User Avatar -->
+                    <label class="checkbox_label">
+                        <input type="checkbox" id="iig_send_user_avatar" ${settings.sendUserAvatar ? 'checked' : ''}>
+                        <span>Аватар пользователя</span>
+                    </label>
 
-                        <div id="iig_user_avatar_row" class="flex-row ${!settings.sendUserAvatar ? 'hidden' : ''}" style="margin-top: 5px;">
-                            <label for="iig_user_avatar_file">Аватар пользователя</label>
-                            <select id="iig_user_avatar_file" class="flex1">
-                                <option value="">-- Не выбран --</option>
-                                ${settings.userAvatarFile ? `<option value="${settings.userAvatarFile}" selected>${settings.userAvatarFile}</option>` : ''}
-                            </select>
-                            <div id="iig_refresh_avatars" class="menu_button iig-refresh-btn" title="Обновить список">
-                                <i class="fa-solid fa-sync"></i>
-                            </div>
+                    <div id="iig_user_avatar_row" class="flex-row ${!settings.sendUserAvatar ? 'hidden' : ''}" style="margin-top: 5px;">
+                        <label for="iig_user_avatar_file">Файл аватара</label>
+                        <select id="iig_user_avatar_file" class="flex1">
+                            <option value="">-- Не выбран --</option>
+                            ${settings.userAvatarFile ? `<option value="${settings.userAvatarFile}" selected>${settings.userAvatarFile}</option>` : ''}
+                        </select>
+                        <div id="iig_refresh_avatars" class="menu_button iig-refresh-btn" title="Обновить">
+                            <i class="fa-solid fa-sync"></i>
                         </div>
                     </div>
 
-                    <hr>
-
-                    <h4>Референсы из истории</h4>
-
+                    <!-- Previous Images -->
                     <label class="checkbox_label">
                         <input type="checkbox" id="iig_send_previous_images" ${settings.sendPreviousImages ? 'checked' : ''}>
-                        <span>Отправлять предыдущие картинки как референсы</span>
+                        <span>Предыдущие сгенерированные картинки</span>
                     </label>
 
-                    <div class="flex-row ${!settings.sendPreviousImages ? 'iig-hidden' : ''}" id="iig_max_prev_row">
-                        <label for="iig_max_previous_images">Макс. предыдущих картинок</label>
-                        <input type="number" id="iig_max_previous_images" class="text_pole"
-                               value="${settings.maxPreviousImages || 2}" min="1" max="4" style="width: 60px;">
+                    <div id="iig_previous_images_row" class="flex-row ${!settings.sendPreviousImages ? 'hidden' : ''}" style="margin-top: 5px;">
+                        <label for="iig_previous_images_count">Количество</label>
+                        <input type="number" id="iig_previous_images_count" class="text_pole flex1"
+                               value="${settings.previousImagesCount}" min="1" max="4">
                     </div>
-
-                    <label class="checkbox_label">
-                        <input type="checkbox" id="iig_send_style_reference" ${settings.sendStyleReference ? 'checked' : ''}>
-                        <span>Первая картинка = style reference</span>
-                    </label>
 
                     <hr>
 
-                    <div id="iig_npc_section" class="iig-npc-section">
-                        <h4>NPC Референсы</h4>
-                        <p class="hint">Загрузите картинки для NPC персонажей. Расширение автоматически найдёт их имена в промпте и отправит как референсы.</p>
+                    <!-- NPC References -->
+                    <h4>NPC Референсы</h4>
+                    <p class="hint">Добавьте NPC с именем и картинкой. Когда имя NPC появляется в промпте, его референс автоматически добавляется.</p>
 
-                        <div id="iig_npc_list" class="iig-npc-list">
-                        </div>
+                    <label class="checkbox_label">
+                        <input type="checkbox" id="iig_enable_npc_references" ${settings.enableNpcReferences ? 'checked' : ''}>
+                        <span>Включить NPC референсы</span>
+                    </label>
 
+                    <div id="iig_npc_section" class="${!settings.enableNpcReferences ? 'hidden' : ''}">
                         <div class="flex-row" style="margin-top: 10px;">
-                            <input type="text" id="iig_new_npc_name" class="text_pole flex1" placeholder="Имя NPC (например: Luca)">
-                            <div id="iig_add_npc" class="menu_button" title="Добавить NPC">
+                            <input type="text" id="iig_npc_name" class="text_pole flex1" placeholder="Имя NPC">
+                            <input type="file" id="iig_npc_file" accept="image/*" style="display: none;">
+                            <div id="iig_npc_select_file" class="menu_button" title="Выбрать картинку">
+                                <i class="fa-solid fa-image"></i>
+                            </div>
+                            <div id="iig_npc_add" class="menu_button" title="Добавить NPC">
                                 <i class="fa-solid fa-plus"></i>
                             </div>
+                        </div>
+                        <div id="iig_npc_file_name" class="hint" style="margin-top: 5px;"></div>
+
+                        <div id="iig_npc_list" class="iig-npc-list" style="margin-top: 10px;">
+                            ${buildNpcListHtml()}
                         </div>
                     </div>
 
@@ -1659,7 +1809,6 @@ function createSettingsUI() {
                             <i class="fa-solid fa-download"></i> Экспорт логов
                         </div>
                     </div>
-                    <p class="hint">Экспортировать логи расширения для отладки проблем.</p>
                 </div>
             </div>
         </div>
@@ -1667,11 +1816,15 @@ function createSettingsUI() {
 
     container.insertAdjacentHTML('beforeend', html);
 
-    bindSettingsEvents();
+    bindSettingsEvents(buildNpcListHtml);
 }
 
-function bindSettingsEvents() {
+/**
+ * Bind settings event handlers
+ */
+function bindSettingsEvents(buildNpcListHtml) {
     const settings = getSettings();
+    let selectedNpcFile = null;
 
     const updateVisibility = () => {
         const apiType = settings.apiType;
@@ -1680,15 +1833,10 @@ function bindSettingsEvents() {
         const isOpenAI = apiType === 'openai';
 
         document.getElementById('iig_model_row')?.classList.toggle('iig-hidden', isNaistera);
-
         document.getElementById('iig_size_row')?.classList.toggle('iig-hidden', !isOpenAI);
         document.getElementById('iig_quality_row')?.classList.toggle('iig-hidden', !isOpenAI);
-
         document.getElementById('iig_naistera_aspect_row')?.classList.toggle('iig-hidden', !isNaistera);
         document.getElementById('iig_naistera_preset_row')?.classList.toggle('iig-hidden', !isNaistera);
-        document.getElementById('iig_naistera_refs_section')?.classList.toggle('iig-hidden', !isNaistera);
-        document.getElementById('iig_naistera_user_avatar_row')?.classList.toggle('iig-hidden', !(isNaistera && settings.naisteraSendUserAvatar));
-
         document.getElementById('iig_naistera_hint')?.classList.toggle('iig-hidden', !isNaistera);
 
         const avatarSection = document.getElementById('iig_avatar_section');
@@ -1697,27 +1845,49 @@ function bindSettingsEvents() {
         }
     };
 
+    const refreshNpcList = () => {
+        const listEl = document.getElementById('iig_npc_list');
+        if (listEl) {
+            listEl.innerHTML = buildNpcListHtml();
+            // Re-bind delete handlers
+            listEl.querySelectorAll('.iig-npc-delete').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const index = parseInt(e.currentTarget.dataset.index);
+                    settings.npcReferences.splice(index, 1);
+                    saveSettings();
+                    refreshNpcList();
+                    toastr.success('NPC удалён', 'Генерация картинок');
+                });
+            });
+        }
+    };
+
+    // Enable toggle
     document.getElementById('iig_enabled')?.addEventListener('change', (e) => {
         settings.enabled = e.target.checked;
         saveSettings();
     });
 
+    // API Type
     document.getElementById('iig_api_type')?.addEventListener('change', (e) => {
         settings.apiType = e.target.value;
         saveSettings();
         updateVisibility();
     });
 
+    // Endpoint
     document.getElementById('iig_endpoint')?.addEventListener('input', (e) => {
         settings.endpoint = e.target.value;
         saveSettings();
     });
 
+    // API Key
     document.getElementById('iig_api_key')?.addEventListener('input', (e) => {
         settings.apiKey = e.target.value;
         saveSettings();
     });
 
+    // API Key toggle
     document.getElementById('iig_key_toggle')?.addEventListener('click', () => {
         const input = document.getElementById('iig_api_key');
         const icon = document.querySelector('#iig_key_toggle i');
@@ -1730,6 +1900,7 @@ function bindSettingsEvents() {
         }
     });
 
+    // Model
     document.getElementById('iig_model')?.addEventListener('change', (e) => {
         settings.model = e.target.value;
         saveSettings();
@@ -1741,6 +1912,7 @@ function bindSettingsEvents() {
         }
     });
 
+    // Refresh models
     document.getElementById('iig_refresh_models')?.addEventListener('click', async (e) => {
         const btn = e.currentTarget;
         btn.classList.add('loading');
@@ -1748,10 +1920,9 @@ function bindSettingsEvents() {
         try {
             const models = await fetchModels();
             const select = document.getElementById('iig_model');
-
             const currentModel = settings.model;
 
-            select.innerHTML = '<option value="">-- Выберите модель --</option>';
+            select.innerHTML = '<option value="">-- Выберите --</option>';
 
             for (const model of models) {
                 const option = document.createElement('option');
@@ -1761,34 +1932,39 @@ function bindSettingsEvents() {
                 select.appendChild(option);
             }
 
-            toastr.success(`Найдено моделей: ${models.length}`, 'Генерация картинок');
+            toastr.success(`Найдено: ${models.length}`, 'Генерация картинок');
         } catch (error) {
-            toastr.error('Ошибка загрузки моделей', 'Генерация картинок');
+            toastr.error('Ошибка загрузки', 'Генерация картинок');
         } finally {
             btn.classList.remove('loading');
         }
     });
 
+    // Size
     document.getElementById('iig_size')?.addEventListener('change', (e) => {
         settings.size = e.target.value;
         saveSettings();
     });
 
+    // Quality
     document.getElementById('iig_quality')?.addEventListener('change', (e) => {
         settings.quality = e.target.value;
         saveSettings();
     });
 
+    // Aspect Ratio
     document.getElementById('iig_aspect_ratio')?.addEventListener('change', (e) => {
         settings.aspectRatio = e.target.value;
         saveSettings();
     });
 
+    // Image Size
     document.getElementById('iig_image_size')?.addEventListener('change', (e) => {
         settings.imageSize = e.target.value;
         saveSettings();
     });
 
+    // Naistera settings
     document.getElementById('iig_naistera_aspect_ratio')?.addEventListener('change', (e) => {
         settings.naisteraAspectRatio = e.target.value;
         saveSettings();
@@ -1799,55 +1975,17 @@ function bindSettingsEvents() {
         saveSettings();
     });
 
-    document.getElementById('iig_naistera_send_char_avatar')?.addEventListener('change', (e) => {
+    // Send char avatar
+    document.getElementById('iig_send_char_avatar')?.addEventListener('change', (e) => {
+        settings.sendCharAvatar = e.target.checked;
         settings.naisteraSendCharAvatar = e.target.checked;
         saveSettings();
     });
-    document.getElementById('iig_naistera_send_user_avatar')?.addEventListener('change', (e) => {
-        settings.naisteraSendUserAvatar = e.target.checked;
-        saveSettings();
-        updateVisibility();
-    });
 
-    document.getElementById('iig_naistera_user_avatar_file')?.addEventListener('change', (e) => {
-        settings.userAvatarFile = e.target.value;
-        saveSettings();
-    });
-
-    document.getElementById('iig_naistera_refresh_avatars')?.addEventListener('click', async (e) => {
-        const btn = e.currentTarget;
-        btn.classList.add('loading');
-
-        try {
-            const avatars = await fetchUserAvatars();
-            const select = document.getElementById('iig_naistera_user_avatar_file');
-            const currentAvatar = settings.userAvatarFile;
-
-            select.innerHTML = '<option value="">-- Не выбран --</option>';
-
-            for (const avatar of avatars) {
-                const option = document.createElement('option');
-                option.value = avatar;
-                option.textContent = avatar;
-                option.selected = avatar === currentAvatar;
-                select.appendChild(option);
-            }
-
-            toastr.success(`Найдено аватаров: ${avatars.length}`, 'Генерация картинок');
-        } catch (error) {
-            toastr.error('Ошибка загрузки аватаров', 'Генерация картинок');
-        } finally {
-            btn.classList.remove('loading');
-        }
-    });
-
-    document.getElementById('iig_send_char_avatar')?.addEventListener('change', (e) => {
-        settings.sendCharAvatar = e.target.checked;
-        saveSettings();
-    });
-
+    // Send user avatar
     document.getElementById('iig_send_user_avatar')?.addEventListener('change', (e) => {
         settings.sendUserAvatar = e.target.checked;
+        settings.naisteraSendUserAvatar = e.target.checked;
         saveSettings();
 
         const avatarRow = document.getElementById('iig_user_avatar_row');
@@ -1856,11 +1994,13 @@ function bindSettingsEvents() {
         }
     });
 
+    // User avatar file
     document.getElementById('iig_user_avatar_file')?.addEventListener('change', (e) => {
         settings.userAvatarFile = e.target.value;
         saveSettings();
     });
 
+    // Refresh avatars
     document.getElementById('iig_refresh_avatars')?.addEventListener('click', async (e) => {
         const btn = e.currentTarget;
         btn.classList.add('loading');
@@ -1880,72 +2020,131 @@ function bindSettingsEvents() {
                 select.appendChild(option);
             }
 
-            toastr.success(`Найдено аватаров: ${avatars.length}`, 'Генерация картинок');
+            toastr.success(`Найдено: ${avatars.length}`, 'Генерация картинок');
         } catch (error) {
-            toastr.error('Ошибка загрузки аватаров', 'Генерация картинок');
+            toastr.error('Ошибка загрузки', 'Генерация картинок');
         } finally {
             btn.classList.remove('loading');
         }
     });
 
+    // Previous images
     document.getElementById('iig_send_previous_images')?.addEventListener('change', (e) => {
         settings.sendPreviousImages = e.target.checked;
         saveSettings();
-        document.getElementById('iig_max_prev_row')?.classList.toggle('iig-hidden', !e.target.checked);
+
+        const row = document.getElementById('iig_previous_images_row');
+        if (row) {
+            row.classList.toggle('hidden', !e.target.checked);
+        }
     });
 
-    document.getElementById('iig_max_previous_images')?.addEventListener('input', (e) => {
-        settings.maxPreviousImages = Math.min(4, Math.max(1, parseInt(e.target.value) || 2));
+    document.getElementById('iig_previous_images_count')?.addEventListener('input', (e) => {
+        settings.previousImagesCount = Math.min(4, Math.max(1, parseInt(e.target.value) || 2));
         saveSettings();
     });
 
-    document.getElementById('iig_send_style_reference')?.addEventListener('change', (e) => {
-        settings.sendStyleReference = e.target.checked;
+    // NPC references toggle
+    document.getElementById('iig_enable_npc_references')?.addEventListener('change', (e) => {
+        settings.enableNpcReferences = e.target.checked;
         saveSettings();
+
+        const section = document.getElementById('iig_npc_section');
+        if (section) {
+            section.classList.toggle('hidden', !e.target.checked);
+        }
     });
 
-    document.getElementById('iig_add_npc')?.addEventListener('click', () => {
-        const nameInput = document.getElementById('iig_new_npc_name');
-        const name = nameInput.value.trim();
+    // NPC file select button
+    document.getElementById('iig_npc_select_file')?.addEventListener('click', () => {
+        document.getElementById('iig_npc_file')?.click();
+    });
+
+    // NPC file input
+    document.getElementById('iig_npc_file')?.addEventListener('change', (e) => {
+        const file = e.target.files?.[0];
+        if (file) {
+            selectedNpcFile = file;
+            document.getElementById('iig_npc_file_name').textContent = file.name;
+        }
+    });
+
+    // NPC add button
+    document.getElementById('iig_npc_add')?.addEventListener('click', async () => {
+        const nameInput = document.getElementById('iig_npc_name');
+        const name = nameInput?.value?.trim();
+
         if (!name) {
             toastr.warning('Введите имя NPC', 'Генерация картинок');
             return;
         }
 
-        if (!settings.npcReferenceImages) {
-            settings.npcReferenceImages = {};
-        }
-
-        if (settings.npcReferenceImages[name]) {
-            toastr.warning('NPC с таким именем уже существует', 'Генерация картинок');
+        if (!selectedNpcFile) {
+            toastr.warning('Выберите картинку', 'Генерация картинок');
             return;
         }
 
-        settings.npcReferenceImages[name] = '';
-        saveSettings();
-        renderNpcList();
-        nameInput.value = '';
-        toastr.success(`NPC "${name}" добавлен`, 'Генерация картинок');
+        try {
+            const dataUrl = await readFileAsDataUrl(selectedNpcFile);
+
+            if (!settings.npcReferences) {
+                settings.npcReferences = [];
+            }
+
+            // Check for duplicate name
+            const existingIndex = settings.npcReferences.findIndex(npc => npc.name.toLowerCase() === name.toLowerCase());
+            if (existingIndex !== -1) {
+                // Update existing
+                settings.npcReferences[existingIndex].imageDataUrl = dataUrl;
+                toastr.success(`NPC "${name}" обновлён`, 'Генерация картинок');
+            } else {
+                // Add new
+                settings.npcReferences.push({
+                    name: name,
+                    imageDataUrl: dataUrl
+                });
+                toastr.success(`NPC "${name}" добавлен`, 'Генерация картинок');
+            }
+
+            saveSettings();
+            refreshNpcList();
+
+            // Clear inputs
+            nameInput.value = '';
+            selectedNpcFile = null;
+            document.getElementById('iig_npc_file_name').textContent = '';
+            document.getElementById('iig_npc_file').value = '';
+        } catch (error) {
+            toastr.error(`Ошибка: ${error.message}`, 'Генерация картинок');
+        }
     });
 
+    // Initial NPC list delete handlers
+    refreshNpcList();
+
+    // Max retries
     document.getElementById('iig_max_retries')?.addEventListener('input', (e) => {
-        settings.maxRetries = parseInt(e.target.value) || 3;
+        settings.maxRetries = parseInt(e.target.value) || 0;
         saveSettings();
     });
 
+    // Retry delay
     document.getElementById('iig_retry_delay')?.addEventListener('input', (e) => {
         settings.retryDelay = parseInt(e.target.value) || 1000;
         saveSettings();
     });
 
+    // Export logs
     document.getElementById('iig_export_logs')?.addEventListener('click', () => {
         exportLogs();
     });
 
     updateVisibility();
-    renderNpcList();
 }
 
+/**
+ * Initialize extension
+ */
 (function init() {
     const context = SillyTavern.getContext();
 
@@ -1958,14 +2157,13 @@ function bindSettingsEvents() {
     });
 
     context.eventSource.on(context.event_types.CHAT_CHANGED, () => {
-        iigLog('INFO', 'CHAT_CHANGED event - adding buttons to existing messages');
+        iigLog('INFO', 'CHAT_CHANGED event');
         setTimeout(() => {
             addButtonsToExistingMessages();
         }, 100);
     });
 
     const handleMessage = async (messageId) => {
-        console.log('[IIG] Event triggered for message:', messageId);
         await onMessageReceived(messageId);
     };
 
