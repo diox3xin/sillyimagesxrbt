@@ -1,21 +1,10 @@
 /**
  * Inline Image Generation Extension for SillyTavern
- *
- * Catches [IMG:GEN:{json}] tags in AI messages and generates images via configured API.
- * Supports OpenAI-compatible and Gemini-compatible (nano-banana) endpoints.
- *
- * Features:
- * - Previous image references for consistency
- * - NPC reference system (name + uploaded image)
- * - Fixed Maximum call stack size exceeded
  */
 
 const MODULE_NAME = 'inline_image_gen';
 
-// Track messages currently being processed to prevent duplicate processing
 const processingMessages = new Set();
-
-// Log buffer for debugging
 const logBuffer = [];
 const MAX_LOG_ENTRIES = 200;
 
@@ -50,10 +39,9 @@ function exportLogs() {
     toastr.success('Логи экспортированы', 'Генерация картинок');
 }
 
-// Default settings
 const defaultSettings = Object.freeze({
     enabled: true,
-    apiType: 'openai', // 'openai' | 'gemini' | 'naistera'
+    apiType: 'openai',
     endpoint: '',
     apiKey: '',
     model: '',
@@ -61,121 +49,83 @@ const defaultSettings = Object.freeze({
     quality: 'standard',
     maxRetries: 0,
     retryDelay: 1000,
-    // Nano-banana specific
     sendCharAvatar: false,
     sendUserAvatar: false,
     userAvatarFile: '',
     aspectRatio: '1:1',
     imageSize: '1K',
-    // Naistera specific
     naisteraAspectRatio: '1:1',
     naisteraPreset: '',
     naisteraSendCharAvatar: false,
     naisteraSendUserAvatar: false,
-    // Previous image references
     sendPreviousImages: false,
-    previousImagesCount: 2, // How many previous images to send as reference
-    // NPC references - stored as { name: string, imageDataUrl: string }[]
+    previousImagesCount: 2,
     npcReferences: [],
     enableNpcReferences: false,
 });
 
-// Image model detection keywords
 const IMAGE_MODEL_KEYWORDS = [
     'dall-e', 'midjourney', 'mj', 'journey', 'stable-diffusion', 'sdxl', 'flux',
     'imagen', 'drawing', 'paint', 'image', 'seedream', 'hidream', 'dreamshaper',
     'ideogram', 'nano-banana', 'gpt-image', 'wanx', 'qwen'
 ];
 
-// Video model keywords to exclude
 const VIDEO_MODEL_KEYWORDS = [
     'sora', 'kling', 'jimeng', 'veo', 'pika', 'runway', 'luma',
     'video', 'gen-3', 'minimax', 'cogvideo', 'mochi', 'seedance',
     'vidu', 'wan-ai', 'hunyuan', 'hailuo'
 ];
 
-/**
- * Check if model ID is an image generation model
- */
 function isImageModel(modelId) {
     const mid = modelId.toLowerCase();
-
     for (const kw of VIDEO_MODEL_KEYWORDS) {
         if (mid.includes(kw)) return false;
     }
-
     if (mid.includes('vision') && mid.includes('preview')) return false;
-
     for (const kw of IMAGE_MODEL_KEYWORDS) {
         if (mid.includes(kw)) return true;
     }
-
     return false;
 }
 
-/**
- * Check if model is Gemini/nano-banana type
- */
 function isGeminiModel(modelId) {
     const mid = modelId.toLowerCase();
     return mid.includes('nano-banana');
 }
 
-/**
- * Get extension settings
- */
 function getSettings() {
     const context = SillyTavern.getContext();
-
     if (!context.extensionSettings[MODULE_NAME]) {
         context.extensionSettings[MODULE_NAME] = structuredClone(defaultSettings);
     }
-
     for (const key of Object.keys(defaultSettings)) {
         if (!Object.hasOwn(context.extensionSettings[MODULE_NAME], key)) {
             context.extensionSettings[MODULE_NAME][key] = defaultSettings[key];
         }
     }
-
     return context.extensionSettings[MODULE_NAME];
 }
 
-/**
- * Save settings
- */
 function saveSettings() {
     const context = SillyTavern.getContext();
     context.saveSettingsDebounced();
 }
 
-/**
- * Fetch models list from endpoint
- */
 async function fetchModels() {
     const settings = getSettings();
-
     if (!settings.endpoint || !settings.apiKey) {
         console.warn('[IIG] Cannot fetch models: endpoint or API key not set');
         return [];
     }
-
     const url = `${settings.endpoint.replace(/\/$/, '')}/v1/models`;
-
     try {
         const response = await fetch(url, {
             method: 'GET',
-            headers: {
-                'Authorization': `Bearer ${settings.apiKey}`
-            }
+            headers: { 'Authorization': `Bearer ${settings.apiKey}` }
         });
-
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
         const models = data.data || [];
-
         return models.filter(m => isImageModel(m.id)).map(m => m.id);
     } catch (error) {
         console.error('[IIG] Failed to fetch models:', error);
@@ -184,9 +134,6 @@ async function fetchModels() {
     }
 }
 
-/**
- * Fetch list of user avatars from /User Avatars/ directory
- */
 async function fetchUserAvatars() {
     try {
         const context = SillyTavern.getContext();
@@ -194,11 +141,7 @@ async function fetchUserAvatars() {
             method: 'POST',
             headers: context.getRequestHeaders(),
         });
-
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return await response.json();
     } catch (error) {
         console.error('[IIG] Failed to fetch user avatars:', error);
@@ -206,18 +149,13 @@ async function fetchUserAvatars() {
     }
 }
 
-/**
- * Convert image URL to base64 using FileReader (FIXED: no stack overflow)
- */
 async function imageUrlToBase64(url) {
     try {
         const response = await fetch(url);
         const blob = await response.blob();
-
         return await new Promise((resolve, reject) => {
             const reader = new FileReader();
             reader.onloadend = () => {
-                // Remove data URL prefix to get pure base64
                 const result = reader.result;
                 const base64 = result.split(',')[1];
                 resolve(base64);
@@ -231,14 +169,10 @@ async function imageUrlToBase64(url) {
     }
 }
 
-/**
- * Convert image URL to data URL using FileReader (FIXED: no stack overflow)
- */
 async function imageUrlToDataUrl(url) {
     try {
         const response = await fetch(url);
         const blob = await response.blob();
-
         return await new Promise((resolve, reject) => {
             const reader = new FileReader();
             reader.onloadend = () => resolve(reader.result);
@@ -251,29 +185,20 @@ async function imageUrlToDataUrl(url) {
     }
 }
 
-/**
- * Save base64 image to file via SillyTavern API (FIXED: FileReader instead of spread)
- * @param {string} dataUrl - Data URL (data:image/png;base64,...) or URL
- * @returns {Promise<string>} - Relative path to saved file
- */
 async function saveImageToFile(dataUrl) {
     const context = SillyTavern.getContext();
 
-    // If it's a URL, convert to data URL first using FileReader
     if (dataUrl && !dataUrl.startsWith('data:') && (dataUrl.startsWith('http://') || dataUrl.startsWith('https://'))) {
         iigLog('INFO', 'Downloading image from URL...');
         try {
             const response = await fetch(dataUrl);
             const blob = await response.blob();
-
-            // FIX: Use FileReader instead of spread on huge array
             dataUrl = await new Promise((resolve, reject) => {
                 const reader = new FileReader();
                 reader.onloadend = () => resolve(reader.result);
                 reader.onerror = reject;
                 reader.readAsDataURL(blob);
             });
-
             iigLog('INFO', 'Converted URL to data URL via FileReader');
         } catch (err) {
             console.error('[IIG] Failed to download image:', err);
@@ -281,24 +206,19 @@ async function saveImageToFile(dataUrl) {
         }
     }
 
-    // Extract base64 and format from data URL without regex on huge string
     const commaIndex = dataUrl.indexOf(',');
-    if (commaIndex === -1) {
-        throw new Error('Invalid data URL format');
-    }
+    if (commaIndex === -1) throw new Error('Invalid data URL format');
 
-    const metaPart = dataUrl.substring(0, commaIndex); // "data:image/png;base64"
+    const metaPart = dataUrl.substring(0, commaIndex);
     const formatMatch = metaPart.match(/image\/(\w+)/);
     const format = formatMatch ? formatMatch[1] : 'png';
     const base64Data = dataUrl.substring(commaIndex + 1);
 
-    // Get character name for subfolder
     let charName = 'generated';
     if (context.characterId !== undefined && context.characters?.[context.characterId]) {
         charName = context.characters[context.characterId].name || 'generated';
     }
 
-    // Generate unique filename
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const filename = `iig_${timestamp}`;
 
@@ -323,22 +243,14 @@ async function saveImageToFile(dataUrl) {
     return result.path;
 }
 
-/**
- * Get character avatar as base64
- */
 async function getCharacterAvatarBase64() {
     try {
         const context = SillyTavern.getContext();
-
-        if (context.characterId === undefined || context.characterId === null) {
-            return null;
-        }
+        if (context.characterId === undefined || context.characterId === null) return null;
 
         if (typeof context.getCharacterAvatar === 'function') {
             const avatarUrl = context.getCharacterAvatar(context.characterId);
-            if (avatarUrl) {
-                return await imageUrlToBase64(avatarUrl);
-            }
+            if (avatarUrl) return await imageUrlToBase64(avatarUrl);
         }
 
         const character = context.characters?.[context.characterId];
@@ -346,7 +258,6 @@ async function getCharacterAvatarBase64() {
             const avatarUrl = `/characters/${encodeURIComponent(character.avatar)}`;
             return await imageUrlToBase64(avatarUrl);
         }
-
         return null;
     } catch (error) {
         console.error('[IIG] Error getting character avatar:', error);
@@ -354,22 +265,14 @@ async function getCharacterAvatarBase64() {
     }
 }
 
-/**
- * Get character avatar as data URL
- */
 async function getCharacterAvatarDataUrl() {
     try {
         const context = SillyTavern.getContext();
-
-        if (context.characterId === undefined || context.characterId === null) {
-            return null;
-        }
+        if (context.characterId === undefined || context.characterId === null) return null;
 
         if (typeof context.getCharacterAvatar === 'function') {
             const avatarUrl = context.getCharacterAvatar(context.characterId);
-            if (avatarUrl) {
-                return await imageUrlToDataUrl(avatarUrl);
-            }
+            if (avatarUrl) return await imageUrlToDataUrl(avatarUrl);
         }
 
         const character = context.characters?.[context.characterId];
@@ -377,7 +280,6 @@ async function getCharacterAvatarDataUrl() {
             const avatarUrl = `/characters/${encodeURIComponent(character.avatar)}`;
             return await imageUrlToDataUrl(avatarUrl);
         }
-
         return null;
     } catch (error) {
         console.error('[IIG] Error getting character avatar data URL:', error);
@@ -385,17 +287,10 @@ async function getCharacterAvatarDataUrl() {
     }
 }
 
-/**
- * Get user avatar as base64
- */
 async function getUserAvatarBase64() {
     try {
         const settings = getSettings();
-
-        if (!settings.userAvatarFile) {
-            return null;
-        }
-
+        if (!settings.userAvatarFile) return null;
         const avatarUrl = `/User Avatars/${encodeURIComponent(settings.userAvatarFile)}`;
         return await imageUrlToBase64(avatarUrl);
     } catch (error) {
@@ -404,15 +299,10 @@ async function getUserAvatarBase64() {
     }
 }
 
-/**
- * Get user avatar as data URL
- */
 async function getUserAvatarDataUrl() {
     try {
         const settings = getSettings();
-        if (!settings.userAvatarFile) {
-            return null;
-        }
+        if (!settings.userAvatarFile) return null;
         const avatarUrl = `/User Avatars/${encodeURIComponent(settings.userAvatarFile)}`;
         return await imageUrlToDataUrl(avatarUrl);
     } catch (error) {
@@ -421,33 +311,20 @@ async function getUserAvatarDataUrl() {
     }
 }
 
-/**
- * Get previously generated images from chat as references
- * @param {number} count - How many images to get
- * @returns {Promise<string[]>} - Array of base64 strings
- */
 async function getPreviousGeneratedImages(count = 2) {
     const context = SillyTavern.getContext();
     const references = [];
+    if (!context.chat || context.chat.length === 0) return references;
 
-    if (!context.chat || context.chat.length === 0) {
-        return references;
-    }
-
-    // Search from newest to oldest
     for (let i = context.chat.length - 1; i >= 0 && references.length < count; i--) {
         const message = context.chat[i];
         if (!message.mes) continue;
 
-        // Find generated image paths in message
-        // Look for src="/user/images/..." pattern (our saved images)
         const imgPathRegex = /src=["']?(\/user\/images\/[^"'\s>]+)/gi;
         let match;
 
         while ((match = imgPathRegex.exec(message.mes)) !== null && references.length < count) {
             const imagePath = match[1];
-
-            // Skip error images
             if (imagePath.includes('error.svg')) continue;
 
             try {
@@ -461,21 +338,14 @@ async function getPreviousGeneratedImages(count = 2) {
             }
         }
     }
-
     iigLog('INFO', `Collected ${references.length} previous image references`);
     return references;
 }
 
-/**
- * Get previously generated images as data URLs (for Naistera)
- */
 async function getPreviousGeneratedImagesDataUrls(count = 2) {
     const context = SillyTavern.getContext();
     const references = [];
-
-    if (!context.chat || context.chat.length === 0) {
-        return references;
-    }
+    if (!context.chat || context.chat.length === 0) return references;
 
     for (let i = context.chat.length - 1; i >= 0 && references.length < count; i--) {
         const message = context.chat[i];
@@ -490,26 +360,17 @@ async function getPreviousGeneratedImagesDataUrls(count = 2) {
 
             try {
                 const dataUrl = await imageUrlToDataUrl(imagePath);
-                if (dataUrl) {
-                    references.push(dataUrl);
-                }
+                if (dataUrl) references.push(dataUrl);
             } catch (e) {
                 iigLog('WARN', `Failed to load previous image as data URL: ${imagePath}`);
             }
         }
     }
-
     return references;
 }
 
-/**
- * Find NPC references that match names in the prompt
- * @param {string} prompt - The image generation prompt
- * @returns {Promise<{name: string, base64: string}[]>} - Matching NPC references
- */
 async function findMatchingNpcReferences(prompt) {
     const settings = getSettings();
-
     if (!settings.enableNpcReferences || !settings.npcReferences || settings.npcReferences.length === 0) {
         return [];
     }
@@ -519,33 +380,21 @@ async function findMatchingNpcReferences(prompt) {
 
     for (const npc of settings.npcReferences) {
         if (!npc.name || !npc.imageDataUrl) continue;
-
-        // Check if NPC name appears in prompt (case-insensitive)
         const nameLower = npc.name.toLowerCase();
         if (promptLower.includes(nameLower)) {
-            // Convert data URL to base64
             const commaIndex = npc.imageDataUrl.indexOf(',');
             const base64 = commaIndex !== -1 ? npc.imageDataUrl.substring(commaIndex + 1) : null;
-
             if (base64) {
-                matches.push({
-                    name: npc.name,
-                    base64: base64
-                });
+                matches.push({ name: npc.name, base64: base64 });
                 iigLog('INFO', `Found NPC reference match: ${npc.name}`);
             }
         }
     }
-
     return matches;
 }
 
-/**
- * Find NPC references as data URLs (for Naistera)
- */
 async function findMatchingNpcReferencesDataUrls(prompt) {
     const settings = getSettings();
-
     if (!settings.enableNpcReferences || !settings.npcReferences || settings.npcReferences.length === 0) {
         return [];
     }
@@ -555,27 +404,18 @@ async function findMatchingNpcReferencesDataUrls(prompt) {
 
     for (const npc of settings.npcReferences) {
         if (!npc.name || !npc.imageDataUrl) continue;
-
         const nameLower = npc.name.toLowerCase();
         if (promptLower.includes(nameLower)) {
-            matches.push({
-                name: npc.name,
-                dataUrl: npc.imageDataUrl
-            });
+            matches.push({ name: npc.name, dataUrl: npc.imageDataUrl });
             iigLog('INFO', `Found NPC reference match (data URL): ${npc.name}`);
         }
     }
-
     return matches;
 }
 
-/**
- * Generate image via OpenAI-compatible endpoint
- */
 async function generateImageOpenAI(prompt, style, referenceImages = [], options = {}) {
     const settings = getSettings();
     const url = `${settings.endpoint.replace(/\/$/, '')}/v1/images/generations`;
-
     const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
 
     let size = settings.size;
@@ -613,7 +453,6 @@ async function generateImageOpenAI(prompt, style, referenceImages = [], options 
     }
 
     const result = await response.json();
-
     const dataList = result.data || [];
     if (dataList.length === 0) {
         if (result.url) return result.url;
@@ -621,21 +460,13 @@ async function generateImageOpenAI(prompt, style, referenceImages = [], options 
     }
 
     const imageObj = dataList[0];
-
-    if (imageObj.b64_json) {
-        return `data:image/png;base64,${imageObj.b64_json}`;
-    }
-
+    if (imageObj.b64_json) return `data:image/png;base64,${imageObj.b64_json}`;
     return imageObj.url;
 }
 
-// Valid aspect ratios for Gemini/nano-banana
 const VALID_ASPECT_RATIOS = ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'];
 const VALID_IMAGE_SIZES = ['1K', '2K', '4K'];
 
-/**
- * Generate image via Gemini-compatible endpoint (nano-banana)
- */
 async function generateImageGemini(prompt, style, referenceImages = [], options = {}) {
     const settings = getSettings();
     const model = settings.model;
@@ -654,39 +485,24 @@ async function generateImageGemini(prompt, style, referenceImages = [], options 
     iigLog('INFO', `Using aspect ratio: ${aspectRatio}, image size: ${imageSize}`);
 
     const parts = [];
-
-    // Add reference images first (up to 4)
     for (const imgB64 of referenceImages.slice(0, 4)) {
-        parts.push({
-            inlineData: {
-                mimeType: 'image/png',
-                data: imgB64
-            }
-        });
+        parts.push({ inlineData: { mimeType: 'image/png', data: imgB64 } });
     }
 
     let fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
-
     if (referenceImages.length > 0) {
         const refInstruction = `[CRITICAL: The reference image(s) above show the EXACT appearance of the character(s). You MUST precisely copy their: face structure, eye color, hair color and style, skin tone, body type, clothing, and all distinctive features. Do not deviate from the reference appearances.]`;
         fullPrompt = `${refInstruction}\n\n${fullPrompt}`;
     }
 
     parts.push({ text: fullPrompt });
-
     iigLog('INFO', `Gemini request: ${referenceImages.length} reference image(s) + prompt (${fullPrompt.length} chars)`);
 
     const body = {
-        contents: [{
-            role: 'user',
-            parts: parts
-        }],
+        contents: [{ role: 'user', parts: parts }],
         generationConfig: {
             responseModalities: ['TEXT', 'IMAGE'],
-            imageConfig: {
-                aspectRatio: aspectRatio,
-                imageSize: imageSize
-            }
+            imageConfig: { aspectRatio: aspectRatio, imageSize: imageSize }
         }
     };
 
@@ -705,44 +521,28 @@ async function generateImageGemini(prompt, style, referenceImages = [], options 
     }
 
     const result = await response.json();
-
     const candidates = result.candidates || [];
-    if (candidates.length === 0) {
-        throw new Error('No candidates in response');
-    }
+    if (candidates.length === 0) throw new Error('No candidates in response');
 
     const responseParts = candidates[0].content?.parts || [];
-
     for (const part of responseParts) {
-        if (part.inlineData) {
-            return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-        }
-        if (part.inline_data) {
-            return `data:${part.inline_data.mime_type};base64,${part.inline_data.data}`;
-        }
+        if (part.inlineData) return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+        if (part.inline_data) return `data:${part.inline_data.mime_type};base64,${part.inline_data.data}`;
     }
-
     throw new Error('No image found in Gemini response');
 }
 
-/**
- * Generate image via Naistera custom endpoint
- */
 async function generateImageNaistera(prompt, style, options = {}) {
     const settings = getSettings();
     const endpoint = settings.endpoint.replace(/\/$/, '');
     const url = endpoint.endsWith('/api/generate') ? endpoint : `${endpoint}/api/generate`;
 
     const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
-
     const aspectRatio = options.aspectRatio || settings.naisteraAspectRatio || '1:1';
     const preset = options.preset || settings.naisteraPreset || null;
     const referenceImages = options.referenceImages || [];
 
-    const body = {
-        prompt: fullPrompt,
-        aspect_ratio: aspectRatio,
-    };
+    const body = { prompt: fullPrompt, aspect_ratio: aspectRatio };
     if (preset) body.preset = preset;
     if (referenceImages.length > 0) body.reference_images = referenceImages.slice(0, 4);
 
@@ -761,38 +561,19 @@ async function generateImageNaistera(prompt, style, options = {}) {
     }
 
     const result = await response.json();
-    if (!result?.data_url) {
-        throw new Error('No data_url in response');
-    }
-
+    if (!result?.data_url) throw new Error('No data_url in response');
     return result.data_url;
 }
 
-/**
- * Validate settings before generation
- */
 function validateSettings() {
     const settings = getSettings();
     const errors = [];
-
-    if (!settings.endpoint) {
-        errors.push('URL эндпоинта не настроен');
-    }
-    if (!settings.apiKey) {
-        errors.push('API ключ не настроен');
-    }
-    if (settings.apiType !== 'naistera' && !settings.model) {
-        errors.push('Модель не выбрана');
-    }
-
-    if (errors.length > 0) {
-        throw new Error(`Ошибка настроек: ${errors.join(', ')}`);
-    }
+    if (!settings.endpoint) errors.push('URL эндпоинта не настроен');
+    if (!settings.apiKey) errors.push('API ключ не настроен');
+    if (settings.apiType !== 'naistera' && !settings.model) errors.push('Модель не выбрана');
+    if (errors.length > 0) throw new Error(`Ошибка настроек: ${errors.join(', ')}`);
 }
 
-/**
- * Generate image with retry logic and reference collection
- */
 async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {}) {
     validateSettings();
 
@@ -800,14 +581,12 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
     const maxRetries = settings.maxRetries;
     const baseDelay = settings.retryDelay;
 
-    // Collect all reference images
-    const referenceImages = []; // base64 for Gemini/OpenAI
-    const referenceDataUrls = []; // data URLs for Naistera
+    const referenceImages = [];
+    const referenceDataUrls = [];
 
     const isGemini = settings.apiType === 'gemini' || isGeminiModel(settings.model);
     const isNaistera = settings.apiType === 'naistera';
 
-    // 1. Character avatar
     if (isGemini && settings.sendCharAvatar) {
         const charAvatar = await getCharacterAvatarBase64();
         if (charAvatar) referenceImages.push(charAvatar);
@@ -817,7 +596,6 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
         if (d) referenceDataUrls.push(d);
     }
 
-    // 2. User avatar
     if (isGemini && settings.sendUserAvatar) {
         const userAvatar = await getUserAvatarBase64();
         if (userAvatar) referenceImages.push(userAvatar);
@@ -827,10 +605,8 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
         if (d) referenceDataUrls.push(d);
     }
 
-    // 3. Previous generated images
     if (settings.sendPreviousImages && settings.previousImagesCount > 0) {
         onStatusUpdate?.('Загрузка предыдущих картинок...');
-
         if (isGemini) {
             const prevImages = await getPreviousGeneratedImages(settings.previousImagesCount);
             referenceImages.push(...prevImages);
@@ -841,10 +617,8 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
         }
     }
 
-    // 4. NPC references (matched by name in prompt)
     if (settings.enableNpcReferences) {
         onStatusUpdate?.('Поиск NPC референсов...');
-
         if (isGemini) {
             const npcMatches = await findMatchingNpcReferences(prompt);
             for (const npc of npcMatches) {
@@ -864,7 +638,6 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
     iigLog('INFO', `Total references collected: ${referenceImages.length} base64, ${referenceDataUrls.length} data URLs`);
 
     let lastError;
-
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
             onStatusUpdate?.(`Генерация${attempt > 0 ? ` (повтор ${attempt}/${maxRetries})` : ''}...`);
@@ -887,22 +660,16 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
                                error.message?.includes('timeout') ||
                                error.message?.includes('network');
 
-            if (!isRetryable || attempt === maxRetries) {
-                break;
-            }
+            if (!isRetryable || attempt === maxRetries) break;
 
             const delay = baseDelay * Math.pow(2, attempt);
             onStatusUpdate?.(`Повтор через ${delay / 1000}с...`);
             await new Promise(resolve => setTimeout(resolve, delay));
         }
     }
-
     throw lastError;
 }
 
-/**
- * Check if a file exists on the server
- */
 async function checkFileExists(path) {
     try {
         const response = await fetch(path, { method: 'HEAD' });
@@ -912,14 +679,10 @@ async function checkFileExists(path) {
     }
 }
 
-/**
- * Parse image generation tags from message text
- */
 async function parseImageTags(text, options = {}) {
     const { checkExistence = false, forceAll = false } = options;
     const tags = [];
 
-    // === NEW FORMAT: <img data-iig-instruction="{...}" src="[IMG:GEN]"> ===
     const imgTagMarker = 'data-iig-instruction=';
     let searchPos = 0;
 
@@ -947,45 +710,22 @@ async function parseImageTags(text, options = {}) {
 
         for (let i = jsonStart; i < text.length; i++) {
             const char = text[i];
-
-            if (escapeNext) {
-                escapeNext = false;
-                continue;
-            }
-
-            if (char === '\\' && inString) {
-                escapeNext = true;
-                continue;
-            }
-
-            if (char === '"') {
-                inString = !inString;
-                continue;
-            }
-
+            if (escapeNext) { escapeNext = false; continue; }
+            if (char === '\\' && inString) { escapeNext = true; continue; }
+            if (char === '"') { inString = !inString; continue; }
             if (!inString) {
-                if (char === '{') {
-                    braceCount++;
-                } else if (char === '}') {
+                if (char === '{') braceCount++;
+                else if (char === '}') {
                     braceCount--;
-                    if (braceCount === 0) {
-                        jsonEnd = i + 1;
-                        break;
-                    }
+                    if (braceCount === 0) { jsonEnd = i + 1; break; }
                 }
             }
         }
 
-        if (jsonEnd === -1) {
-            searchPos = markerPos + 1;
-            continue;
-        }
+        if (jsonEnd === -1) { searchPos = markerPos + 1; continue; }
 
         let imgEnd = text.indexOf('>', jsonEnd);
-        if (imgEnd === -1) {
-            searchPos = markerPos + 1;
-            continue;
-        }
+        if (imgEnd === -1) { searchPos = markerPos + 1; continue; }
         imgEnd++;
 
         const fullImgTag = text.substring(imgStart, imgEnd);
@@ -999,37 +739,21 @@ async function parseImageTags(text, options = {}) {
         const hasErrorImage = srcValue.includes('error.svg');
         const hasPath = srcValue && srcValue.startsWith('/') && srcValue.length > 5;
 
-        if (hasErrorImage && !forceAll) {
-            searchPos = imgEnd;
-            continue;
-        }
+        if (hasErrorImage && !forceAll) { searchPos = imgEnd; continue; }
 
-        if (forceAll) {
-            needsGeneration = true;
-        } else if (hasMarker || !srcValue) {
-            needsGeneration = true;
-        } else if (hasPath && checkExistence) {
+        if (forceAll) needsGeneration = true;
+        else if (hasMarker || !srcValue) needsGeneration = true;
+        else if (hasPath && checkExistence) {
             const exists = await checkFileExists(srcValue);
-            if (!exists) {
-                needsGeneration = true;
-            }
-        } else if (hasPath) {
-            searchPos = imgEnd;
-            continue;
-        }
+            if (!exists) needsGeneration = true;
+        } else if (hasPath) { searchPos = imgEnd; continue; }
 
-        if (!needsGeneration) {
-            searchPos = imgEnd;
-            continue;
-        }
+        if (!needsGeneration) { searchPos = imgEnd; continue; }
 
         try {
             let normalizedJson = instructionJson
-                .replace(/"/g, '"')
-                .replace(/'/g, "'")
-                .replace(/'/g, "'")
-                .replace(/"/g, '"')
-                .replace(/&/g, '&');
+                .replace(/"/g, '"').replace(/'/g, "'").replace(/'/g, "'")
+                .replace(/"/g, '"').replace(/&/g, '&');
 
             const data = JSON.parse(normalizedJson);
 
@@ -1052,7 +776,6 @@ async function parseImageTags(text, options = {}) {
         searchPos = imgEnd;
     }
 
-    // === LEGACY FORMAT: [IMG:GEN:{...}] ===
     const marker = '[IMG:GEN:';
     let searchStart = 0;
 
@@ -1069,47 +792,23 @@ async function parseImageTags(text, options = {}) {
 
         for (let i = jsonStart; i < text.length; i++) {
             const char = text[i];
-
-            if (escapeNext) {
-                escapeNext = false;
-                continue;
-            }
-
-            if (char === '\\' && inString) {
-                escapeNext = true;
-                continue;
-            }
-
-            if (char === '"') {
-                inString = !inString;
-                continue;
-            }
-
+            if (escapeNext) { escapeNext = false; continue; }
+            if (char === '\\' && inString) { escapeNext = true; continue; }
+            if (char === '"') { inString = !inString; continue; }
             if (!inString) {
-                if (char === '{') {
-                    braceCount++;
-                } else if (char === '}') {
+                if (char === '{') braceCount++;
+                else if (char === '}') {
                     braceCount--;
-                    if (braceCount === 0) {
-                        jsonEnd = i + 1;
-                        break;
-                    }
+                    if (braceCount === 0) { jsonEnd = i + 1; break; }
                 }
             }
         }
 
-        if (jsonEnd === -1) {
-            searchStart = jsonStart;
-            continue;
-        }
+        if (jsonEnd === -1) { searchStart = jsonStart; continue; }
 
         const jsonStr = text.substring(jsonStart, jsonEnd);
-
         const afterJson = text.substring(jsonEnd);
-        if (!afterJson.startsWith(']')) {
-            searchStart = jsonEnd;
-            continue;
-        }
+        if (!afterJson.startsWith(']')) { searchStart = jsonEnd; continue; }
 
         const tagOnly = text.substring(markerIndex, jsonEnd + 1);
 
@@ -1138,9 +837,6 @@ async function parseImageTags(text, options = {}) {
     return tags;
 }
 
-/**
- * Create loading placeholder element
- */
 function createLoadingPlaceholder(tagId) {
     const placeholder = document.createElement('div');
     placeholder.className = 'iig-loading-placeholder';
@@ -1154,9 +850,6 @@ function createLoadingPlaceholder(tagId) {
 
 const ERROR_IMAGE_PATH = '/scripts/extensions/third-party/sillyimages/error.svg';
 
-/**
- * Create error placeholder element
- */
 function createErrorPlaceholder(tagId, errorMessage, tagInfo) {
     const img = document.createElement('img');
     img.className = 'iig-error-image';
@@ -1167,23 +860,16 @@ function createErrorPlaceholder(tagId, errorMessage, tagInfo) {
 
     if (tagInfo.fullMatch) {
         const instructionMatch = tagInfo.fullMatch.match(/data-iig-instruction\s*=\s*(['"])([\s\S]*?)\1/i);
-        if (instructionMatch) {
-            img.setAttribute('data-iig-instruction', instructionMatch[2]);
-        }
+        if (instructionMatch) img.setAttribute('data-iig-instruction', instructionMatch[2]);
     }
-
     return img;
 }
 
-/**
- * Process image tags in a message
- */
 async function processMessageTags(messageId) {
     const context = SillyTavern.getContext();
     const settings = getSettings();
 
     if (!settings.enabled) return;
-
     if (processingMessages.has(messageId)) {
         iigLog('WARN', `Message ${messageId} is already being processed, skipping`);
         return;
@@ -1193,30 +879,20 @@ async function processMessageTags(messageId) {
     if (!message || message.is_user) return;
 
     const tags = await parseImageTags(message.mes, { checkExistence: true });
-
-    if (tags.length === 0) {
-        return;
-    }
+    if (tags.length === 0) return;
 
     processingMessages.add(messageId);
     iigLog('INFO', `Found ${tags.length} image tag(s) in message ${messageId}`);
     toastr.info(`Найдено тегов: ${tags.length}. Генерация...`, 'Генерация картинок', { timeOut: 3000 });
 
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
-    if (!messageElement) {
-        processingMessages.delete(messageId);
-        return;
-    }
+    if (!messageElement) { processingMessages.delete(messageId); return; }
 
     const mesTextEl = messageElement.querySelector('.mes_text');
-    if (!mesTextEl) {
-        processingMessages.delete(messageId);
-        return;
-    }
+    if (!mesTextEl) { processingMessages.delete(messageId); return; }
 
     const processTag = async (tag, index) => {
         const tagId = `iig-${messageId}-${index}`;
-
         const loadingPlaceholder = createLoadingPlaceholder(tagId);
         let targetElement = null;
 
@@ -1226,22 +902,14 @@ async function processMessageTags(messageId) {
 
             for (const img of allImgs) {
                 const instruction = img.getAttribute('data-iig-instruction');
-                const src = img.getAttribute('src') || '';
-
                 if (instruction) {
                     const decodedInstruction = instruction
-                        .replace(/"/g, '"')
-                        .replace(/'/g, "'")
-                        .replace(/'/g, "'")
-                        .replace(/"/g, '"')
-                        .replace(/&/g, '&');
+                        .replace(/"/g, '"').replace(/'/g, "'").replace(/'/g, "'")
+                        .replace(/"/g, '"').replace(/&/g, '&');
 
                     const normalizedSearchPrompt = searchPrompt
-                        .replace(/"/g, '"')
-                        .replace(/'/g, "'")
-                        .replace(/'/g, "'")
-                        .replace(/"/g, '"')
-                        .replace(/&/g, '&');
+                        .replace(/"/g, '"').replace(/'/g, "'").replace(/'/g, "'")
+                        .replace(/"/g, '"').replace(/&/g, '&');
 
                     if (decodedInstruction.includes(normalizedSearchPrompt)) {
                         targetElement = img;
@@ -1345,9 +1013,7 @@ async function processMessageTags(messageId) {
 
             if (tag.isNewFormat) {
                 const instructionMatch = tag.fullMatch.match(/data-iig-instruction\s*=\s*(['"])([\s\S]*?)\1/i);
-                if (instructionMatch) {
-                    img.setAttribute('data-iig-instruction', instructionMatch[2]);
-                }
+                if (instructionMatch) img.setAttribute('data-iig-instruction', instructionMatch[2]);
             }
 
             loadingPlaceholder.replaceWith(img);
@@ -1382,22 +1048,13 @@ async function processMessageTags(messageId) {
 
     try {
         await Promise.all(tags.map((tag, index) => processTag(tag, index)));
-
-        // Save chat BEFORE removing from processing set
         await context.saveChat();
         iigLog('INFO', `Finished processing message ${messageId}`);
     } finally {
-        // Remove from processing set AFTER saveChat
         processingMessages.delete(messageId);
     }
-
-    // REMOVED: Re-render via innerHTML - causes potential loops and overwrites our DOM changes
-    // The DOM is already updated via replaceWith(), and message.mes is updated for persistence
 }
 
-/**
- * Regenerate all images in a message
- */
 async function regenerateMessageImages(messageId) {
     const context = SillyTavern.getContext();
     const message = context.chat[messageId];
@@ -1420,16 +1077,10 @@ async function regenerateMessageImages(messageId) {
     processingMessages.add(messageId);
 
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
-    if (!messageElement) {
-        processingMessages.delete(messageId);
-        return;
-    }
+    if (!messageElement) { processingMessages.delete(messageId); return; }
 
     const mesTextEl = messageElement.querySelector('.mes_text');
-    if (!mesTextEl) {
-        processingMessages.delete(messageId);
-        return;
-    }
+    if (!mesTextEl) { processingMessages.delete(messageId); return; }
 
     for (let index = 0; index < tags.length; index++) {
         const tag = tags[index];
@@ -1459,9 +1110,7 @@ async function regenerateMessageImages(messageId) {
                 img.className = 'iig-generated-image';
                 img.src = imagePath;
                 img.alt = tag.prompt;
-                if (instruction) {
-                    img.setAttribute('data-iig-instruction', instruction);
-                }
+                if (instruction) img.setAttribute('data-iig-instruction', instruction);
                 loadingPlaceholder.replaceWith(img);
 
                 const updatedTag = tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${imagePath}"`);
@@ -1480,9 +1129,6 @@ async function regenerateMessageImages(messageId) {
     iigLog('INFO', `Regeneration complete for message ${messageId}`);
 }
 
-/**
- * Add regenerate button to message
- */
 function addRegenerateButton(messageElement, messageId) {
     if (messageElement.querySelector('.iig-regenerate-btn')) return;
 
@@ -1501,9 +1147,6 @@ function addRegenerateButton(messageElement, messageId) {
     extraMesButtons.appendChild(btn);
 }
 
-/**
- * Add regenerate buttons to all existing AI messages
- */
 function addButtonsToExistingMessages() {
     const context = SillyTavern.getContext();
     if (!context.chat || context.chat.length === 0) return;
@@ -1527,31 +1170,19 @@ function addButtonsToExistingMessages() {
     iigLog('INFO', `Added regenerate buttons to ${addedCount} existing messages`);
 }
 
-/**
- * Handle CHARACTER_MESSAGE_RENDERED event
- */
 async function onMessageReceived(messageId) {
     iigLog('INFO', `onMessageReceived: ${messageId}`);
 
     const settings = getSettings();
-    if (!settings.enabled) {
-        return;
-    }
-
-    const context = SillyTavern.getContext();
-    const message = context.chat[messageId];
+    if (!settings.enabled) return;
 
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
     if (!messageElement) return;
 
     addRegenerateButton(messageElement, messageId);
-
     await processMessageTags(messageId);
 }
 
-/**
- * Read file as data URL
- */
 function readFileAsDataUrl(file) {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
@@ -1561,9 +1192,6 @@ function readFileAsDataUrl(file) {
     });
 }
 
-/**
- * Create settings UI
- */
 function createSettingsUI() {
     const settings = getSettings();
 
@@ -1573,20 +1201,19 @@ function createSettingsUI() {
         return;
     }
 
-  // Build NPC list HTML - COMPACT VERSION
-const buildNpcListHtml = () => {
-    if (!settings.npcReferences || settings.npcReferences.length === 0) {
-        return '<div class="iig-npc-empty">Нет добавленных NPC</div>';
-    }
+    const buildNpcListHtml = () => {
+        if (!settings.npcReferences || settings.npcReferences.length === 0) {
+            return '<div class="iig-npc-empty">Нет добавленных NPC</div>';
+        }
 
-    return settings.npcReferences.map((npc, index) => `
-        <div class="iig-npc-item" data-index="${index}">
-            <img src="${npc.imageDataUrl}" class="iig-npc-thumbnail" alt="${npc.name}">
-            <span class="iig-npc-name" title="${npc.name}">${npc.name}</span>
-            <div class="iig-npc-delete menu_button fa-solid fa-xmark" data-index="${index}" title="Удалить"></div>
-        </div>
-    `).join('');
-};
+        return settings.npcReferences.map((npc, index) => `
+            <div class="iig-npc-item" data-index="${index}">
+                <img src="${npc.imageDataUrl}" class="iig-npc-thumbnail" alt="${npc.name}">
+                <span class="iig-npc-name" title="${npc.name}">${npc.name}</span>
+                <div class="iig-npc-delete menu_button fa-solid fa-xmark" data-index="${index}" title="Удалить"></div>
+            </div>
+        `).join('');
+    };
 
     const html = `
         <div class="inline-drawer">
@@ -1596,7 +1223,6 @@ const buildNpcListHtml = () => {
             </div>
             <div class="inline-drawer-content">
                 <div class="iig-settings">
-                    <!-- Enable/Disable -->
                     <label class="checkbox_label">
                         <input type="checkbox" id="iig_enabled" ${settings.enabled ? 'checked' : ''}>
                         <span>Включить генерацию картинок</span>
@@ -1606,7 +1232,6 @@ const buildNpcListHtml = () => {
 
                     <h4>Настройки API</h4>
 
-                    <!-- API Type -->
                     <div class="flex-row">
                         <label for="iig_api_type">Тип API</label>
                         <select id="iig_api_type" class="flex1">
@@ -1616,26 +1241,20 @@ const buildNpcListHtml = () => {
                         </select>
                     </div>
 
-                    <!-- Endpoint -->
                     <div class="flex-row">
                         <label for="iig_endpoint">URL эндпоинта</label>
-                        <input type="text" id="iig_endpoint" class="text_pole flex1"
-                               value="${settings.endpoint}"
-                               placeholder="https://api.example.com">
+                        <input type="text" id="iig_endpoint" class="text_pole flex1" value="${settings.endpoint}" placeholder="https://api.example.com">
                     </div>
 
-                    <!-- API Key -->
                     <div class="flex-row">
                         <label for="iig_api_key">API ключ</label>
-                        <input type="password" id="iig_api_key" class="text_pole flex1"
-                               value="${settings.apiKey}">
+                        <input type="password" id="iig_api_key" class="text_pole flex1" value="${settings.apiKey}">
                         <div id="iig_key_toggle" class="menu_button iig-key-toggle" title="Показать/Скрыть">
                             <i class="fa-solid fa-eye"></i>
                         </div>
                     </div>
                     <p id="iig_naistera_hint" class="hint ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}">Для Naistera/Grok: токен из Telegram бота.</p>
 
-                    <!-- Model -->
                     <div class="flex-row ${settings.apiType === 'naistera' ? 'iig-hidden' : ''}" id="iig_model_row">
                         <label for="iig_model">Модель</label>
                         <select id="iig_model" class="flex1">
@@ -1650,7 +1269,6 @@ const buildNpcListHtml = () => {
 
                     <h4>Параметры генерации</h4>
 
-                    <!-- OpenAI Size -->
                     <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_size_row">
                         <label for="iig_size">Размер</label>
                         <select id="iig_size" class="flex1">
@@ -1660,7 +1278,6 @@ const buildNpcListHtml = () => {
                         </select>
                     </div>
 
-                    <!-- OpenAI Quality -->
                     <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_quality_row">
                         <label for="iig_quality">Качество</label>
                         <select id="iig_quality" class="flex1">
@@ -1669,7 +1286,6 @@ const buildNpcListHtml = () => {
                         </select>
                     </div>
 
-                    <!-- Naistera params -->
                     <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_aspect_row">
                         <label for="iig_naistera_aspect_ratio">Соотношение</label>
                         <select id="iig_naistera_aspect_ratio" class="flex1">
@@ -1689,7 +1305,6 @@ const buildNpcListHtml = () => {
 
                     <hr>
 
-                    <!-- Gemini/Nano-banana settings -->
                     <div id="iig_avatar_section" class="iig-avatar-section ${settings.apiType !== 'gemini' ? 'hidden' : ''}">
                         <h4>Настройки Nano-Banana</h4>
 
@@ -1716,17 +1331,14 @@ const buildNpcListHtml = () => {
                         <hr>
                     </div>
 
-                    <!-- References Section -->
                     <h4>Референсы</h4>
                     <p class="hint">Отправлять изображения как референсы для консистентной генерации.</p>
 
-                    <!-- Character Avatar -->
                     <label class="checkbox_label">
                         <input type="checkbox" id="iig_send_char_avatar" ${settings.sendCharAvatar ? 'checked' : ''}>
                         <span>Аватар персонажа</span>
                     </label>
 
-                    <!-- User Avatar -->
                     <label class="checkbox_label">
                         <input type="checkbox" id="iig_send_user_avatar" ${settings.sendUserAvatar ? 'checked' : ''}>
                         <span>Аватар пользователя</span>
@@ -1743,7 +1355,6 @@ const buildNpcListHtml = () => {
                         </div>
                     </div>
 
-                    <!-- Previous Images -->
                     <label class="checkbox_label">
                         <input type="checkbox" id="iig_send_previous_images" ${settings.sendPreviousImages ? 'checked' : ''}>
                         <span>Предыдущие сгенерированные картинки</span>
@@ -1751,47 +1362,45 @@ const buildNpcListHtml = () => {
 
                     <div id="iig_previous_images_row" class="flex-row ${!settings.sendPreviousImages ? 'hidden' : ''}" style="margin-top: 5px;">
                         <label for="iig_previous_images_count">Количество</label>
-                        <input type="number" id="iig_previous_images_count" class="text_pole flex1"
-                               value="${settings.previousImagesCount}" min="1" max="4">
+                        <input type="number" id="iig_previous_images_count" class="text_pole flex1" value="${settings.previousImagesCount}" min="1" max="4">
                     </div>
 
                     <hr>
 
-                    <!-- NPC References -->
-<h4>NPC Референсы</h4>
-<p class="hint">Имя NPC в промпте = автоматический референс</p>
+                    <h4>NPC Референсы</h4>
+                    <p class="hint">Имя NPC в промпте = автоматический референс</p>
 
-<label class="checkbox_label">
-    <input type="checkbox" id="iig_enable_npc_references" ${settings.enableNpcReferences ? 'checked' : ''}>
-    <span>Включить NPC референсы</span>
-</label>
+                    <label class="checkbox_label">
+                        <input type="checkbox" id="iig_enable_npc_references" ${settings.enableNpcReferences ? 'checked' : ''}>
+                        <span>Включить NPC референсы</span>
+                    </label>
 
-<div id="iig_npc_section" class="${!settings.enableNpcReferences ? 'hidden' : ''}">
-    <div class="iig-npc-add-form">
-        <input type="text" id="iig_npc_name" class="text_pole" placeholder="Имя NPC">
-        <img id="iig_npc_preview" class="iig-npc-file-preview" src="" alt="">
-        <input type="file" id="iig_npc_file" accept="image/*" style="display: none;">
-        <div id="iig_npc_select_file" class="menu_button fa-solid fa-image" title="Картинка"></div>
-        <div id="iig_npc_add" class="menu_button fa-solid fa-plus" title="Добавить"></div>
-    </div>
+                    <div id="iig_npc_section" class="${!settings.enableNpcReferences ? 'hidden' : ''}">
+                        <div class="iig-npc-add-form">
+                            <input type="text" id="iig_npc_name" class="text_pole" placeholder="Имя NPC">
+                            <img id="iig_npc_preview" class="iig-npc-file-preview" src="" alt="">
+                            <input type="file" id="iig_npc_file" accept="image/*" style="display: none;">
+                            <div id="iig_npc_select_file" class="menu_button fa-solid fa-image" title="Картинка"></div>
+                            <div id="iig_npc_add" class="menu_button fa-solid fa-plus" title="Добавить"></div>
+                        </div>
 
-    <div id="iig_npc_list" class="iig-npc-list">
-        ${buildNpcListHtml()}
-    </div>
-</div>
+                        <div id="iig_npc_list" class="iig-npc-list">
+                            ${buildNpcListHtml()}
+                        </div>
+                    </div>
+
+                    <hr>
 
                     <h4>Обработка ошибок</h4>
 
                     <div class="flex-row">
                         <label for="iig_max_retries">Макс. повторов</label>
-                        <input type="number" id="iig_max_retries" class="text_pole flex1"
-                               value="${settings.maxRetries}" min="0" max="5">
+                        <input type="number" id="iig_max_retries" class="text_pole flex1" value="${settings.maxRetries}" min="0" max="5">
                     </div>
 
                     <div class="flex-row">
                         <label for="iig_retry_delay">Задержка (мс)</label>
-                        <input type="number" id="iig_retry_delay" class="text_pole flex1"
-                               value="${settings.retryDelay}" min="500" max="10000" step="500">
+                        <input type="number" id="iig_retry_delay" class="text_pole flex1" value="${settings.retryDelay}" min="500" max="10000" step="500">
                     </div>
 
                     <hr>
@@ -1809,13 +1418,9 @@ const buildNpcListHtml = () => {
     `;
 
     container.insertAdjacentHTML('beforeend', html);
-
     bindSettingsEvents(buildNpcListHtml);
 }
 
-/**
- * Bind settings event handlers
- */
 function bindSettingsEvents(buildNpcListHtml) {
     const settings = getSettings();
     let selectedNpcFile = null;
@@ -1834,16 +1439,13 @@ function bindSettingsEvents(buildNpcListHtml) {
         document.getElementById('iig_naistera_hint')?.classList.toggle('iig-hidden', !isNaistera);
 
         const avatarSection = document.getElementById('iig_avatar_section');
-        if (avatarSection) {
-            avatarSection.classList.toggle('hidden', !isGemini);
-        }
+        if (avatarSection) avatarSection.classList.toggle('hidden', !isGemini);
     };
 
     const refreshNpcList = () => {
         const listEl = document.getElementById('iig_npc_list');
         if (listEl) {
             listEl.innerHTML = buildNpcListHtml();
-            // Re-bind delete handlers
             listEl.querySelectorAll('.iig-npc-delete').forEach(btn => {
                 btn.addEventListener('click', (e) => {
                     const index = parseInt(e.currentTarget.dataset.index);
@@ -1856,32 +1458,27 @@ function bindSettingsEvents(buildNpcListHtml) {
         }
     };
 
-    // Enable toggle
     document.getElementById('iig_enabled')?.addEventListener('change', (e) => {
         settings.enabled = e.target.checked;
         saveSettings();
     });
 
-    // API Type
     document.getElementById('iig_api_type')?.addEventListener('change', (e) => {
         settings.apiType = e.target.value;
         saveSettings();
         updateVisibility();
     });
 
-    // Endpoint
     document.getElementById('iig_endpoint')?.addEventListener('input', (e) => {
         settings.endpoint = e.target.value;
         saveSettings();
     });
 
-    // API Key
     document.getElementById('iig_api_key')?.addEventListener('input', (e) => {
         settings.apiKey = e.target.value;
         saveSettings();
     });
 
-    // API Key toggle
     document.getElementById('iig_key_toggle')?.addEventListener('click', () => {
         const input = document.getElementById('iig_api_key');
         const icon = document.querySelector('#iig_key_toggle i');
@@ -1894,7 +1491,6 @@ function bindSettingsEvents(buildNpcListHtml) {
         }
     });
 
-    // Model
     document.getElementById('iig_model')?.addEventListener('change', (e) => {
         settings.model = e.target.value;
         saveSettings();
@@ -1906,7 +1502,6 @@ function bindSettingsEvents(buildNpcListHtml) {
         }
     });
 
-    // Refresh models
     document.getElementById('iig_refresh_models')?.addEventListener('click', async (e) => {
         const btn = e.currentTarget;
         btn.classList.add('loading');
@@ -1934,31 +1529,26 @@ function bindSettingsEvents(buildNpcListHtml) {
         }
     });
 
-    // Size
     document.getElementById('iig_size')?.addEventListener('change', (e) => {
         settings.size = e.target.value;
         saveSettings();
     });
 
-    // Quality
     document.getElementById('iig_quality')?.addEventListener('change', (e) => {
         settings.quality = e.target.value;
         saveSettings();
     });
 
-    // Aspect Ratio
     document.getElementById('iig_aspect_ratio')?.addEventListener('change', (e) => {
         settings.aspectRatio = e.target.value;
         saveSettings();
     });
 
-    // Image Size
     document.getElementById('iig_image_size')?.addEventListener('change', (e) => {
         settings.imageSize = e.target.value;
         saveSettings();
     });
 
-    // Naistera settings
     document.getElementById('iig_naistera_aspect_ratio')?.addEventListener('change', (e) => {
         settings.naisteraAspectRatio = e.target.value;
         saveSettings();
@@ -1969,32 +1559,26 @@ function bindSettingsEvents(buildNpcListHtml) {
         saveSettings();
     });
 
-    // Send char avatar
     document.getElementById('iig_send_char_avatar')?.addEventListener('change', (e) => {
         settings.sendCharAvatar = e.target.checked;
         settings.naisteraSendCharAvatar = e.target.checked;
         saveSettings();
     });
 
-    // Send user avatar
     document.getElementById('iig_send_user_avatar')?.addEventListener('change', (e) => {
         settings.sendUserAvatar = e.target.checked;
         settings.naisteraSendUserAvatar = e.target.checked;
         saveSettings();
 
         const avatarRow = document.getElementById('iig_user_avatar_row');
-        if (avatarRow) {
-            avatarRow.classList.toggle('hidden', !e.target.checked);
-        }
+        if (avatarRow) avatarRow.classList.toggle('hidden', !e.target.checked);
     });
 
-    // User avatar file
     document.getElementById('iig_user_avatar_file')?.addEventListener('change', (e) => {
         settings.userAvatarFile = e.target.value;
         saveSettings();
     });
 
-    // Refresh avatars
     document.getElementById('iig_refresh_avatars')?.addEventListener('click', async (e) => {
         const btn = e.currentTarget;
         btn.classList.add('loading');
@@ -2022,15 +1606,12 @@ function bindSettingsEvents(buildNpcListHtml) {
         }
     });
 
-    // Previous images
     document.getElementById('iig_send_previous_images')?.addEventListener('change', (e) => {
         settings.sendPreviousImages = e.target.checked;
         saveSettings();
 
         const row = document.getElementById('iig_previous_images_row');
-        if (row) {
-            row.classList.toggle('hidden', !e.target.checked);
-        }
+        if (row) row.classList.toggle('hidden', !e.target.checked);
     });
 
     document.getElementById('iig_previous_images_count')?.addEventListener('input', (e) => {
@@ -2038,55 +1619,38 @@ function bindSettingsEvents(buildNpcListHtml) {
         saveSettings();
     });
 
-    // NPC references toggle
     document.getElementById('iig_enable_npc_references')?.addEventListener('change', (e) => {
         settings.enableNpcReferences = e.target.checked;
         saveSettings();
 
         const section = document.getElementById('iig_npc_section');
-        if (section) {
-            section.classList.toggle('hidden', !e.target.checked);
-        }
+        if (section) section.classList.toggle('hidden', !e.target.checked);
     });
 
-    // NPC file select button
     document.getElementById('iig_npc_select_file')?.addEventListener('click', () => {
         document.getElementById('iig_npc_file')?.click();
     });
 
-// NPC file input - с превью!
-document.getElementById('iig_npc_file')?.addEventListener('change', async (e) => {
-    const file = e.target.files?.[0];
-    const preview = document.getElementById('iig_npc_preview');
+    document.getElementById('iig_npc_file')?.addEventListener('change', async (e) => {
+        const file = e.target.files?.[0];
+        const preview = document.getElementById('iig_npc_preview');
 
-    if (file) {
-        selectedNpcFile = file;
-
-        // Показать превью
-        const dataUrl = await readFileAsDataUrl(file);
-        if (preview) {
-            preview.src = dataUrl;
-            preview.classList.add('has-image');
+        if (file) {
+            selectedNpcFile = file;
+            const dataUrl = await readFileAsDataUrl(file);
+            if (preview) {
+                preview.src = dataUrl;
+                preview.classList.add('has-image');
+            }
+        } else {
+            selectedNpcFile = null;
+            if (preview) {
+                preview.src = '';
+                preview.classList.remove('has-image');
+            }
         }
-    } else {
-        selectedNpcFile = null;
-        if (preview) {
-            preview.src = '';
-            preview.classList.remove('has-image');
-        }
-    }
-});
-
-// После успешного добавления NPC - очистить превью:
-// В обработчике iig_npc_add после saveSettings():
-const preview = document.getElementById('iig_npc_preview');
-if (preview) {
-    preview.src = '';
-    preview.classList.remove('has-image');
-}
     });
 
-    // NPC add button
     document.getElementById('iig_npc_add')?.addEventListener('click', async () => {
         const nameInput = document.getElementById('iig_npc_name');
         const name = nameInput?.value?.trim();
@@ -2104,54 +1668,45 @@ if (preview) {
         try {
             const dataUrl = await readFileAsDataUrl(selectedNpcFile);
 
-            if (!settings.npcReferences) {
-                settings.npcReferences = [];
-            }
+            if (!settings.npcReferences) settings.npcReferences = [];
 
-            // Check for duplicate name
             const existingIndex = settings.npcReferences.findIndex(npc => npc.name.toLowerCase() === name.toLowerCase());
             if (existingIndex !== -1) {
-                // Update existing
                 settings.npcReferences[existingIndex].imageDataUrl = dataUrl;
                 toastr.success(`NPC "${name}" обновлён`, 'Генерация картинок');
             } else {
-                // Add new
-                settings.npcReferences.push({
-                    name: name,
-                    imageDataUrl: dataUrl
-                });
+                settings.npcReferences.push({ name: name, imageDataUrl: dataUrl });
                 toastr.success(`NPC "${name}" добавлен`, 'Генерация картинок');
             }
 
             saveSettings();
             refreshNpcList();
 
-            // Clear inputs
             nameInput.value = '';
             selectedNpcFile = null;
-            document.getElementById('iig_npc_file_name').textContent = '';
+            const preview = document.getElementById('iig_npc_preview');
+            if (preview) {
+                preview.src = '';
+                preview.classList.remove('has-image');
+            }
             document.getElementById('iig_npc_file').value = '';
         } catch (error) {
             toastr.error(`Ошибка: ${error.message}`, 'Генерация картинок');
         }
     });
 
-    // Initial NPC list delete handlers
     refreshNpcList();
 
-    // Max retries
     document.getElementById('iig_max_retries')?.addEventListener('input', (e) => {
         settings.maxRetries = parseInt(e.target.value) || 0;
         saveSettings();
     });
 
-    // Retry delay
     document.getElementById('iig_retry_delay')?.addEventListener('input', (e) => {
         settings.retryDelay = parseInt(e.target.value) || 1000;
         saveSettings();
     });
 
-    // Export logs
     document.getElementById('iig_export_logs')?.addEventListener('click', () => {
         exportLogs();
     });
@@ -2159,9 +1714,6 @@ if (preview) {
     updateVisibility();
 }
 
-/**
- * Initialize extension
- */
 (function init() {
     const context = SillyTavern.getContext();
 
